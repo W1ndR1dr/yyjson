@@ -130,6 +130,7 @@ jobs:
           - no_writer
           - no_utf8
           - no_incr
+          - no_stream
           - no_unalign
 
     steps:
@@ -163,6 +164,9 @@ jobs:
         fi
         if [ "${{matrix.opt}}" == "no_incr" ]; then
           BUILD_OPTIONS="${BUILD_OPTIONS} -DYYJSON_DISABLE_INCR_READER=ON"
+        fi
+        if [ "${{matrix.opt}}" == "no_stream" ]; then
+          BUILD_OPTIONS="${BUILD_OPTIONS} -DYYJSON_DISABLE_STREAMING=ON"
         fi
         if [ "${{matrix.opt}}" == "no_unalign" ]; then
           BUILD_OPTIONS="${BUILD_OPTIONS} -DYYJSON_DISABLE_UNALIGNED_MEMORY_ACCESS=ON"

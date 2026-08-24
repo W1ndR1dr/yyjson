@@ -44,6 +44,16 @@
     test_json_reader();
 }
 
+- (void)test_json_sax {
+    extern void test_json_sax(void);
+    test_json_sax();
+}
+
+- (void)test_json_streaming {
+    extern void test_json_streaming(void);
+    test_json_streaming();
+}
+
 - (void)test_json_val {
     extern void test_json_val(void);
     test_json_val();

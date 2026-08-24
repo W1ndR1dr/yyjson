@@ -5,14 +5,16 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 #### Added 
-- Add a set of `write_buf()` functions for writing JSON to a buffer without allocation.
+- Add `yyjson_sr_*` and `yyjson_sw_*` streaming APIs for zero-allocation, forward-only JSON processing.
+- Add a set of `write_buf()` functions for writing DOM to a buffer without allocation.
 - Add `YYJSON_FREESTANDING` compile-time option to build without libc (e.g. wasm).
 - Add `YYJSON_DISABLE_FILE` compile-time option to disable file/fp read and write APIs.
-- Add `YYJSON_READER_DEPTH_LIMIT` compile-time option to limit JSON nesting depth.
+- Add `YYJSON_READER_DEPTH_LIMIT` and `YYJSON_WRITER_DEPTH_LIMIT` compile-time options to limit JSON nesting depth.
 - Add `YYJSON_WRITE_LOWERCASE_HEX` flag to write `\uXXXX` escapes in lowercase.
 - Add Swift Package Manager traits for compile-time configuration.
 
 #### Changed
+- Change `YYJSON_PADDING_SIZE` from 4 to 8 for streaming APIs; DOM ABI remains compatible.
 - Change `set_int()` parameter type from `int` to `int64_t`: #240
 - Add `const` qualifier to parameters of read-only functions: #248
 

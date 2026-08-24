@@ -66,6 +66,7 @@ Supported CMake options (default OFF):
 
 - `-DYYJSON_DISABLE_READER=ON` Disable JSON reader if you don't need it.
 - `-DYYJSON_DISABLE_WRITER=ON` Disable JSON writer if you don't need it.
+- `-DYYJSON_DISABLE_STREAMING=ON` Disable streaming APIs.
 - `-DYYJSON_DISABLE_INCR_READER=ON` Disable incremental reader if you don't need it.
 - `-DYYJSON_DISABLE_FILE=ON` Disable file/fp read and write APIs.
 - `-DYYJSON_DISABLE_UTILS=ON` Disable JSON Pointer, JSON Patch and JSON Merge Patch.
@@ -74,7 +75,8 @@ Supported CMake options (default OFF):
 - `-DYYJSON_DISABLE_UTF8_VALIDATION=ON` Disable UTF-8 validation at compile-time.
 - `-DYYJSON_DISABLE_UNALIGNED_MEMORY_ACCESS=ON` Disable unaligned memory access support at compile-time.
 - `-DYYJSON_FREESTANDING=ON` Build without libc (see `YYJSON_FREESTANDING` below).
-- `-DYYJSON_READER_DEPTH_LIMIT=<n>` Set a maximum nesting depth for JSON containers (see `YYJSON_READER_DEPTH_LIMIT` below).
+- `-DYYJSON_READER_DEPTH_LIMIT=<n>` Set a maximum nesting depth for DOM and streaming readers (see `YYJSON_READER_DEPTH_LIMIT` below).
+- `-DYYJSON_WRITER_DEPTH_LIMIT=<n>` Set a maximum nesting depth for DOM and streaming writers (see `YYJSON_WRITER_DEPTH_LIMIT` below).
 
 
 ## Use CMake as a dependency
@@ -226,7 +228,10 @@ Build and run fuzz test with [LibFuzzer](https://llvm.org/docs/LibFuzzer.html) (
 cmake -E make_directory build; cd build
 cmake .. -DYYJSON_BUILD_FUZZER=ON -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
 cmake --build .
-./fuzzer -dict=fuzzer.dict ./corpus
+./fuzzer -dict=fuzzer.dict ./corpus_fuzzer
+./stream_fuzzer -dict=fuzzer.dict ./corpus_stream_fuzzer
+./patch_fuzzer -dict=fuzzer.dict ./corpus_patch_fuzzer
+./merge_patch_fuzzer -dict=fuzzer.dict ./corpus_merge_patch_fuzzer
 ```
 
 
@@ -254,21 +259,30 @@ It is recommended when JSON serialization is not required.<br/>
 ## YYJSON_DISABLE_INCR_READER
 Define as 1 to disable JSON incremental reader at compile-time.<br/>
 This disables functions with `incr` in their name.<br/>
+Reduces binary size by about 15%.<br/>
 It is recommended when JSON incremental reader is not required.<br/>
+
+## YYJSON_DISABLE_STREAMING
+Define as 1 to disable streaming reader and writer APIs at compile-time.<br/>
+This disables functions with `sr` or `sw` in their name.<br/>
+Reduces binary size by about 20%.<br/>
+It is recommended when streaming APIs are not required.<br/>
 
 ## YYJSON_DISABLE_FILE
 Define as 1 to disable file and `FILE` pointer APIs at compile-time.<br/>
 `stdio.h` is not included by `yyjson.h` when this is set.<br/>
+Has little effect on binary size (about 1%).<br/>
 
 ## YYJSON_DISABLE_UTILS
 Define as 1 to disable JSON Pointer, JSON Patch and JSON Merge Patch support.<br/>
 This disables functions with `ptr` or `patch` in their name.<br/>
+Reduces binary size by about 5%.<br/>
 It is recommended when these functions are not required.<br/>
 
 ## YYJSON_DISABLE_FAST_FP_CONV
 Define as 1 to disable the fast floating-point number conversion in yyjson.<br/>
 Libc's `strtod/snprintf` will be used instead.<br/>
-This reduces binary size by about 30%, but significantly slows down the floating-point read/write speed.<br/>
+This reduces binary size by about 25%, but significantly slows down the floating-point read/write speed.<br/>
 It is recommended when processing JSON with few floating-point numbers.<br/>
 
 ## YYJSON_DISABLE_NON_STANDARD
@@ -316,11 +330,21 @@ File and `FILE` pointer APIs are also disabled (same effect as `YYJSON_DISABLE_F
 Intended for freestanding targets such as WebAssembly without a libc sysroot.
 
 ## YYJSON_READER_DEPTH_LIMIT
-Define as a positive integer to set the maximum allowed nesting depth for JSON arrays and objects.
+Define as a positive integer to set the maximum allowed nesting depth for JSON arrays and objects in DOM and streaming readers.
 
-When the parser encounters a container whose depth exceeds this value, it stops and returns the error code `YYJSON_READ_ERROR_DEPTH`.
+When the parser encounters a container whose depth exceeds this value, it stops and returns `YYJSON_READ_ERROR_DEPTH`.
 
-The default value is `0`, which means unlimited depth is supported. The parser does not use stack recursion, so nesting depth is only bounded by available memory.
+The default value is `0` (no policy limit). The DOM reader is then bounded by
+available memory. The streaming reader remains bounded by its caller-provided
+container stack. Skipped streaming subtrees are not counted.
+
+## YYJSON_WRITER_DEPTH_LIMIT
+Define as a positive integer to set the maximum allowed nesting depth for JSON arrays and objects in DOM and streaming writers.
+
+When a document exceeds this depth, writing stops and returns `YYJSON_WRITE_ERROR_DEPTH`.
+
+The default value is `0` (no policy limit). Writers do not use stack recursion;
+streaming writer capacity is still bounded by the caller-provided buffer.
 
 ## YYJSON_EXPORTS
 Define as 1 to export symbols when building the library as a Windows DLL.

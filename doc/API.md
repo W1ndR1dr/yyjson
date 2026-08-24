@@ -10,7 +10,22 @@ This document contains all the API usage and examples for the yyjson library.
 
 All public functions and structs are prefixed with `yyjson_`, and all constants are prefixed with `YYJSON_`.
 
-## API for immutable/mutable data
+
+## API for DOM and streaming
+
+The library provides two ways to work with JSON:
+
+| | DOM | Streaming |
+|--|-----|-----------|
+| Read | `yyjson_read*` | `yyjson_sr_*` |
+| Write / build | `yyjson_write*` | `yyjson_sw_*` |
+| Memory | Grows with the document | Fixed, caller-provided buffer |
+| Access | Random access after parsing | Forward-only, one pass |
+
+Use the DOM API when the whole document needs to be in memory, with random access and the ability to modify it.<br/>
+Use the streaming API when memory usage must stay bounded, or the data only needs to be read or written once, in order. See "Streaming JSON" for details.
+
+## API for DOM data
 
 The library has 2 types of data structures: immutable and mutable:
 
@@ -46,7 +61,7 @@ yyjson_doc *yyjson_mut_doc_imut_copy(const yyjson_mut_doc *doc, ...);
 yyjson_doc *yyjson_mut_val_imut_copy(const yyjson_mut_val *val, ...);
 ```
 
-## API for string
+## API for DOM string
 The library supports strings with or without null-terminator (`\0`).<br/>
 When you need to use a string without a null-terminator or when you explicitly know the length of the string, you can use the function that ends with `n`, for example:
 ```c
@@ -319,6 +334,8 @@ The complete list of error codes (`yyjson_read_code`):
 | 13 | `YYJSON_READ_ERROR_FILE_READ` | Failed to read a file. |
 | 14 | `YYJSON_READ_ERROR_MORE` | Incomplete input during incremental parsing; state is preserved for continuation. |
 | 15 | `YYJSON_READ_ERROR_DEPTH` | Nesting depth exceeded `YYJSON_READER_DEPTH_LIMIT`. |
+| 16 | `YYJSON_READ_ERROR_BUFFER_LIMIT` | A selected string or number exceeded the streaming-reader buffer. |
+| 17 | `YYJSON_READ_ERROR_IO` | A streaming input callback reported an I/O error. |
 
 ## Reader flag
 The library provides a set of flags for JSON reader.<br/>
@@ -342,15 +359,15 @@ This is the default flag for JSON reader (RFC-8259 or ECMA-404 compliant):
 ### **YYJSON_READ_INSITU**
 Read the input data in-situ.<br/>
 
-This option allows the reader to modify and use the input data to store string values, which can slightly improve reading speed. However, the caller must ensure that the input data is held until the document is freed. The input data must be padded with at least `YYJSON_PADDING_SIZE` bytes. For example: `[1,2]` should be `[1,2]\0\0\0\0`, input length should be 5.
+This option allows the reader to modify and use the input data to store string values, which can slightly improve reading speed. However, the caller must ensure that the input data is held until the document is freed. The input data must be padded with at least `YYJSON_PADDING_SIZE` zero bytes, while the input length remains unchanged.
 
 Sample code:
 
 ```c
 size_t dat_len = ...;
-char *buf = malloc(dat_len + YYJSON_PADDING_SIZE); // create a buffer larger than (len + 4)
+char *buf = malloc(dat_len + YYJSON_PADDING_SIZE); // reserve input padding
 read_from_socket(buf, ...);
-memset(buf + dat_len, 0, YYJSON_PADDING_SIZE); // set 4-byte padding after data
+memset(buf + dat_len, 0, YYJSON_PADDING_SIZE); // set zero padding after data
 
 yyjson_doc *doc = yyjson_read_opts(buf, dat_len, YYJSON_READ_INSITU, NULL, NULL);
 if (doc) {...}
@@ -1564,6 +1581,460 @@ yyjson_mut_val *yyjson_mut_merge_patch(yyjson_mut_doc *doc,
                                        const yyjson_mut_val *patch);
 ```
 
+
+
+---------------
+# Streaming JSON
+
+The streaming reader (`yyjson_sr_*`) and writer (`yyjson_sw_*`) read and write JSON one value at a time, without building a DOM.<br/>
+They operate on a fixed-size buffer supplied by the caller, so memory usage does not grow with the size of the document.<br/>
+This is useful for very large JSON documents, JSON logs (NDJSON), or reading only a few known fields from a much larger document.
+
+Both APIs are forward-only: a reader consumes input from start to end, and a writer produces output the same way. There is no random access; once a value has been passed, it cannot be visited again.
+
+Most functions return `bool`. Once an error occurs, the reader or writer remembers it, and every later call fails as well. It is usually enough to check `yyjson_sr_ok()` / `yyjson_sw_ok()`, or the return value of `yyjson_sr_finish()` / `yyjson_sw_finish()`, once at the end, instead of after every call.
+
+String parameters follow the usual library convention: no suffix takes a null-terminated C string, `n` takes an explicit length, and `_sv` takes a `yyjson_sv`, useful for passing a key or string from a reader directly into a writer.
+
+The streaming APIs read and write standard JSON only ([RFC 8259](https://datatracker.ietf.org/doc/html/rfc8259)). Non-standard extensions such as comments, trailing commas, or `Infinity`/`NaN` are never accepted or produced, even if a flag would normally allow them for the DOM API.
+
+
+## Streaming reader
+
+A streaming reader always works on one **current value**: the root value right after initialization, an array element after `arr_next()`, or an object member after `obj_next()` / `obj_find()`. Read or skip the current value before moving on to the next one.
+
+### Initialize a reader
+
+The reader can take input from memory, from a pull callback, or from a file:
+
+```c
+bool yyjson_sr_init_mem(yyjson_sr *sr, char *src, size_t len,
+                        void *buf, size_t buf_cap, yyjson_read_flag flg);
+bool yyjson_sr_init_fn(yyjson_sr *sr, yyjson_sr_read_fn fn, void *ctx,
+                       void *buf, size_t buf_cap, yyjson_read_flag flg);
+bool yyjson_sr_init_fp(yyjson_sr *sr, FILE *fp,
+                       void *buf, size_t buf_cap, yyjson_read_flag flg);
+```
+
+`src` / `fn` / `fp` is the input. With `yyjson_sr_init_fn()`, the reader pulls data through a callback function:
+
+```c
+// Fill `dst` with up to `cap` bytes and return the number of bytes written.
+// Return 0 at a clean end of input, or (size_t)-1 on I/O error.
+typedef size_t (*yyjson_sr_read_fn)(void *ctx, void *dst, size_t cap);
+```
+
+`buf` / `buf_cap` is a caller-provided working buffer; the reader itself does not allocate memory.<br/>
+`flg` is reader flag, pass 0 if you don't need it. `YYJSON_READ_INSITU`, `YYJSON_READ_NUMBER_AS_RAW`, `YYJSON_READ_BIGNUM_AS_RAW`, and `YYJSON_READ_ALLOW_INVALID_UNICODE` work the same as in the DOM reader. Other flags are ignored, since the streaming reader accepts only standard JSON.
+
+`buf` can be sized manually, or with one of the following:
+
+```c
+#define YYJSON_SR_BUF_SIZE(val_len, depth) /* buffer size for known limits */
+#define YYJSON_SR_MIN_BUF                  /* smallest usable size, 2 KB */
+#define YYJSON_SR_DEF_BUF                  /* recommended size, ~34 KB */
+```
+
+`YYJSON_SR_BUF_SIZE(val_len, depth)` returns a buffer size that can hold any string, key, or number up to `val_len` bytes, while nesting `depth` arrays/objects deep at once.
+
+If a value that is actually read (a string, number, or key) does not fit in `buf`, reading fails with `YYJSON_READ_ERROR_BUFFER_LIMIT`. This never happens for a skipped value, see "Skip, raw, and generic values" below.
+
+Sample code:
+
+```c
+static unsigned char buf[YYJSON_SR_DEF_BUF];
+yyjson_sr reader;
+const char *json = "{\"title\":\"Up\",\"year\":2009,\"rating\":8.3}";
+
+if (!yyjson_sr_init_mem(&reader, (char *)json, strlen(json),
+                        buf, sizeof(buf), 0)) {
+    return false; // invalid argument, e.g. a buffer that is too small
+}
+
+if (!yyjson_sr_obj_begin(&reader)) return false;
+yyjson_sv title = yyjson_sr_obj_read_str(&reader, "title");
+int64_t year = yyjson_sr_obj_read_sint(&reader, "year");
+double rating = yyjson_sr_obj_read_real(&reader, "rating");
+if (!yyjson_sr_obj_end(&reader)) return false;
+
+if (!yyjson_sr_finish(&reader)) return false;
+printf("%s (%lld): %.1f\n", title.ptr, (long long)year, rating);
+// Up (2009): 8.3
+```
+
+The 3 fields above are read without checking each call: if one of them fails, the reader remembers the error, `obj_end()` and `finish()` fail as well, and nothing is printed.
+
+### Read arrays and unknown objects
+
+Use `arr_begin()` / `arr_next()` / `arr_end()` to read an array, and `obj_begin()` / `obj_next()` / `obj_end()` to read an object whose keys are not known ahead of time:
+
+```c
+bool yyjson_sr_arr_begin(yyjson_sr *sr);
+bool yyjson_sr_arr_next(yyjson_sr *sr);
+bool yyjson_sr_arr_end(yyjson_sr *sr);
+
+bool yyjson_sr_obj_begin(yyjson_sr *sr);
+bool yyjson_sr_obj_next(yyjson_sr *sr, yyjson_sv *key);
+bool yyjson_sr_obj_end(yyjson_sr *sr);
+```
+
+`arr_next()` moves to the next element and returns true if one is available, or false at the closing `]`.<br/>
+`obj_next()` works the same way and also returns the member's key. The key is valid only until the next call into the reader, and should be copied to keep it longer.<br/>
+Once `arr_next()` / `obj_next()` returns false at a clean end, call `arr_end()` / `obj_end()` to close the container. A false result can also mean an error rather than a clean end; check `yyjson_sr_ok()` afterward when the distinction matters, or rely on the final `yyjson_sr_finish()` check.
+
+Sample code (sum an array of numbers):
+
+```c
+int64_t sum = 0;
+yyjson_sr_arr_begin(&reader);
+while (yyjson_sr_arr_next(&reader)) {
+    sum += yyjson_sr_read_sint(&reader);
+}
+yyjson_sr_arr_end(&reader);
+```
+
+Sample code (object with unknown keys):
+
+```c
+yyjson_sv key, title = {0};
+yyjson_sr_obj_begin(&reader);
+while (yyjson_sr_obj_next(&reader, &key)) {
+    if (yyjson_sv_equals_str(key, "title")) {
+        title = yyjson_sr_read_str(&reader);
+    } else {
+        yyjson_sr_skip_value(&reader); // not interested, skip it
+    }
+}
+yyjson_sr_obj_end(&reader);
+```
+
+### Find a field by key
+
+```c
+bool yyjson_sr_obj_find(yyjson_sr *sr, const char *key);
+bool yyjson_sr_obj_findn(yyjson_sr *sr, const char *key, size_t key_len);
+```
+
+`obj_find()` looks for a member by key, skipping over everything that does not match. It searches forward only, so calls for multiple keys should follow the same order the keys appear in the JSON. If the object ends before the key is found, it returns false without setting an error; check `yyjson_sr_ok()` to distinguish a clean miss from a real error:
+
+```c
+yyjson_sv title = {0};
+yyjson_sr_obj_begin(&reader);
+if (yyjson_sr_obj_find(&reader, "title")) {
+    title = yyjson_sr_read_str(&reader);
+}
+yyjson_sr_obj_end(&reader);
+```
+
+Reading a required field is common enough to have a dedicated shortcut. `obj_read_*()` combines `obj_find()` with a typed read, and treats a missing or invalid field as an error:
+
+```c
+double yyjson_sr_obj_read_real(yyjson_sr *sr, const char *key);
+uint64_t yyjson_sr_obj_read_uint(yyjson_sr *sr, const char *key);
+int64_t yyjson_sr_obj_read_sint(yyjson_sr *sr, const char *key);
+yyjson_sv yyjson_sr_obj_read_str(yyjson_sr *sr, const char *key);
+bool yyjson_sr_obj_read_bool(yyjson_sr *sr, const char *key);
+void yyjson_sr_obj_read_null(yyjson_sr *sr, const char *key);
+```
+
+This is the pattern already used in the "Initialize a reader" sample above. `obj_read_bool()` returns the JSON value itself, just like `read_bool()`, so `false` can mean either the JSON value `false` or an error.
+
+### Read typed values
+
+```c
+yyjson_sv yyjson_sr_read_str(yyjson_sr *sr);
+uint64_t yyjson_sr_read_uint(yyjson_sr *sr);
+int64_t yyjson_sr_read_sint(yyjson_sr *sr);
+double yyjson_sr_read_real(yyjson_sr *sr);
+bool yyjson_sr_read_bool(yyjson_sr *sr);
+void yyjson_sr_read_null(yyjson_sr *sr);
+```
+
+Each function reads the current value as the given type. Most return a default (0, 0.0, false, or an empty view) on error; `read_null()` has nothing to return, so `yyjson_sr_ok()` should be checked to know whether it actually succeeded.
+
+When the type of the current value is not known ahead of time, check it first:
+
+```c
+yyjson_type yyjson_sr_peek_type(yyjson_sr *sr);
+```
+
+Sample code (array with mixed types):
+
+```c
+while (yyjson_sr_arr_next(&reader)) {
+    switch (yyjson_sr_peek_type(&reader)) {
+        case YYJSON_TYPE_STR:
+            handle_str(yyjson_sr_read_str(&reader));
+            break;
+        case YYJSON_TYPE_NUM:
+            handle_num(yyjson_sr_read_real(&reader));
+            break;
+        default:
+            yyjson_sr_skip_value(&reader);
+            break;
+    }
+}
+yyjson_sr_arr_end(&reader);
+```
+
+`peek_type()` only looks at the current value. Use `arr_next()` / `obj_next()`, not `peek_type()`, to check for the end of a container.
+
+### Skip, raw, and generic values
+
+```c
+bool yyjson_sr_skip_value(yyjson_sr *sr);
+yyjson_sv yyjson_sr_read_raw(yyjson_sr *sr);
+yyjson_val yyjson_sr_read_num(yyjson_sr *sr);
+yyjson_val yyjson_sr_read_scalar(yyjson_sr *sr);
+```
+
+`skip_value()` skips the current value, no matter what it is or how deeply nested. A skipped value is never fully parsed, so it can be arbitrarily large without needing a bigger buffer. `arr_end()` / `obj_end()` also skip any values that were not read before closing a container.
+
+`read_num()` and `read_scalar()` return a standalone `yyjson_val`, the same value type used by the DOM API, so the usual `yyjson_get_str()`, `yyjson_is_num()`, and other DOM value functions can be used on it. `read_num()` expects a number; `read_scalar()` accepts any scalar (string, number, `true`/`false`, or `null`); neither works on an array or object. The value, and any string or raw data it points to, are valid only until the next call into the reader. `read_raw()` returns a scalar exactly as it appears in the JSON text, without parsing it.
+
+These are useful for writing a generic reader, one that forwards whatever value it sees instead of interpreting it. See "Transform a stream" below.
+
+Note: a skipped or raw value is not fully validated; the reader only tracks string boundaries and bracket nesting while passing over it. For example, skipping `{"a":tru,"b":1}` does not raise an error for the truncated `tru`, as long as `"b"` can still be found afterward. Reading every value, instead of skipping, is required to fully validate the input; `yyjson_read()` always does this.
+
+### String views
+
+Strings from the reader are returned as a `yyjson_sv`, a pointer and a byte length:
+
+```c
+typedef struct yyjson_sv {
+    const char *ptr;
+    size_t len;
+} yyjson_sv;
+
+yyjson_sv yyjson_sv_make(const char *str, size_t len);
+bool yyjson_sv_equals_str(yyjson_sv sv, const char *str);
+bool yyjson_sv_equals_strn(yyjson_sv sv, const char *str, size_t len);
+```
+
+A `yyjson_sv` from `read_str()`, an object key, or `obj_read_str()` is null-terminated, but valid only until the next call into the reader; it should be copied to keep it longer. `yyjson_sv_equals_str()` is the usual way to compare an unknown key or value against a C string. `yyjson_sv_make()` builds a view directly, for example to compare against a substring.
+
+### Check for errors
+
+```c
+bool yyjson_sr_ok(const yyjson_sr *sr);
+yyjson_read_code yyjson_sr_get_err(const yyjson_sr *sr, yyjson_read_err *err);
+uint64_t yyjson_sr_pos(const yyjson_sr *sr);
+```
+
+`yyjson_sr_ok()` reports whether the reader has hit an error yet. `yyjson_sr_get_err()` fills in a `yyjson_read_err`, the same struct used by the DOM reader, so `err.code`, `err.msg`, and `err.pos` all work the same way. `yyjson_sr_pos()` returns the exact byte offset the reader has reached, as a `uint64_t`, which matters once the input is larger than 4 GB.
+
+Sample code:
+
+```c
+if (!yyjson_sr_finish(&reader)) {
+    yyjson_read_err err;
+    yyjson_sr_get_err(&reader, &err);
+    printf("read error: %s, code: %u, at byte position: %llu\n",
+           err.msg, err.code, (unsigned long long)yyjson_sr_pos(&reader));
+}
+```
+
+### Finish reading, and NDJSON
+
+```c
+bool yyjson_sr_finish(yyjson_sr *sr);
+bool yyjson_sr_doc_next(yyjson_sr *sr);
+```
+
+For a single JSON document, read the root value once, then call `yyjson_sr_finish()`. It checks that every container was closed and that only whitespace is left in the input.
+
+For NDJSON, or several JSON values back to back, call `yyjson_sr_doc_next()` before each one:
+
+```c
+while (yyjson_sr_doc_next(&reader)) {
+    read_one_line(&reader);
+}
+if (!yyjson_sr_ok(&reader)) { /* a real error, not just the end of input */ }
+```
+
+`doc_next()` returns false both at a clean end of input and on error; check `yyjson_sr_ok()` to tell them apart. The loop above already reads every document, so there is no need to call `yyjson_sr_finish()` after it.
+
+
+## Streaming writer
+
+The writer mirrors the reader: `arr_begin()` / `arr_end()`, `obj_begin()` / `obj_end()`, and sticky errors all work the same way, just in the write direction.
+
+### Initialize a writer
+
+```c
+bool yyjson_sw_init_mem(yyjson_sw *sw, void *dst, size_t dst_cap,
+                        yyjson_write_flag flg);
+bool yyjson_sw_init_fn(yyjson_sw *sw, yyjson_sw_write_fn fn, void *ctx,
+                       void *buf, size_t buf_cap, yyjson_write_flag flg);
+bool yyjson_sw_init_fp(yyjson_sw *sw, FILE *fp,
+                       void *buf, size_t buf_cap, yyjson_write_flag flg);
+```
+
+With `yyjson_sw_init_mem()`, JSON is written directly into `dst`, so `dst_cap` must be large enough to hold the whole output. The output is **not** null-terminated; use `yyjson_sw_len()` to get its length.
+
+With `yyjson_sw_init_fn()` / `yyjson_sw_init_fp()`, output can be arbitrarily long. `buf` is a working buffer that batches bytes before they are pushed out through the callback:
+
+```c
+// Write all `len` bytes from `src` and return true on success.
+typedef bool (*yyjson_sw_write_fn)(void *ctx, const void *src, size_t len);
+
+#define YYJSON_SW_BUF_SIZE(depth) /* buffer size for a known depth */
+#define YYJSON_SW_MIN_BUF         /* smallest usable size, 64 bytes */
+#define YYJSON_SW_DEF_BUF         /* recommended size, 16 KB */
+```
+
+`flg` is writer flag, pass 0 if you don't need it. Pretty printing, escaping, and the floating-point flags all work the same as in the DOM writer. `YYJSON_WRITE_ALLOW_INF_AND_NAN` is ignored, since `Infinity`/`NaN` are not standard JSON; use `YYJSON_WRITE_INF_AND_NAN_AS_NULL` to write them as `null` instead.
+
+Sample code:
+
+```c
+char output[256];
+yyjson_sw writer;
+
+yyjson_sw_init_mem(&writer, output, sizeof(output), 0);
+yyjson_sw_obj_begin(&writer);
+yyjson_sw_write_key(&writer, "title");
+yyjson_sw_write_str(&writer, "Up");
+yyjson_sw_write_key(&writer, "year");
+yyjson_sw_write_uint(&writer, 2009);
+yyjson_sw_obj_end(&writer);
+
+if (!yyjson_sw_finish(&writer)) return false;
+fwrite(output, 1, (size_t)yyjson_sw_len(&writer), stdout);
+// {"title":"Up","year":2009}
+```
+
+### Write values
+
+```c
+bool yyjson_sw_arr_begin(yyjson_sw *sw);
+bool yyjson_sw_arr_end(yyjson_sw *sw);
+bool yyjson_sw_obj_begin(yyjson_sw *sw);
+bool yyjson_sw_obj_end(yyjson_sw *sw);
+
+bool yyjson_sw_write_key(yyjson_sw *sw, const char *key);
+bool yyjson_sw_write_keyn(yyjson_sw *sw, const char *key, size_t len);
+bool yyjson_sw_write_key_sv(yyjson_sw *sw, yyjson_sv key);
+
+bool yyjson_sw_write_str(yyjson_sw *sw, const char *str);
+bool yyjson_sw_write_strn(yyjson_sw *sw, const char *str, size_t len);
+bool yyjson_sw_write_sv(yyjson_sw *sw, yyjson_sv sv);
+
+bool yyjson_sw_write_uint(yyjson_sw *sw, uint64_t val);
+bool yyjson_sw_write_sint(yyjson_sw *sw, int64_t val);
+bool yyjson_sw_write_real(yyjson_sw *sw, double val);
+bool yyjson_sw_write_bool(yyjson_sw *sw, bool val);
+bool yyjson_sw_write_null(yyjson_sw *sw);
+```
+
+A value written between `arr_begin()` / `arr_end()` becomes an array element; the writer inserts the commas automatically. Inside an object, every `write_key*()` must be followed by exactly one value. Every `arr_begin()` / `obj_begin()` needs a matching `arr_end()` / `obj_end()`.
+
+Sample code (array):
+
+```c
+yyjson_sw_arr_begin(&writer);
+for (size_t i = 0; i < count; i++) {
+    yyjson_sw_write_uint(&writer, values[i]);
+}
+yyjson_sw_arr_end(&writer);
+```
+
+### Write raw and bridged values
+
+```c
+bool yyjson_sw_write_num(yyjson_sw *sw, const yyjson_val *num);
+bool yyjson_sw_write_scalar(yyjson_sw *sw, const yyjson_val *val);
+bool yyjson_sw_write_rawn(yyjson_sw *sw, const char *raw, size_t len);
+bool yyjson_sw_write_raw(yyjson_sw *sw, const char *raw);
+```
+
+`write_num()` and `write_scalar()` take a `yyjson_val`, the same value returned by `yyjson_sr_read_num()` / `yyjson_sr_read_scalar()`, or a value from a DOM. This is the easiest way to copy a value from a reader (or a DOM) into a writer without inspecting its type. `write_num()` accepts only an actual number; use `write_scalar()` instead when the value might be RAW, for example when it came from a reader using `YYJSON_READ_NUMBER_AS_RAW`.
+
+`write_raw()` writes a piece of JSON text exactly as given, without validating or escaping it. The text must be exactly one complete JSON value; the caller is responsible for its validity.
+
+### Check for errors
+
+```c
+bool yyjson_sw_ok(const yyjson_sw *sw);
+yyjson_write_code yyjson_sw_get_err(const yyjson_sw *sw, yyjson_write_err *err);
+uint64_t yyjson_sw_len(const yyjson_sw *sw);
+```
+
+This works the same way as the reader: once something goes wrong, every later call fails, so checking `yyjson_sw_finish()` (or `yyjson_sw_ok()`) once is usually enough. `yyjson_sw_len()` returns the total number of bytes written so far, including bytes already pushed out through the callback.
+
+A few error codes are specific to the streaming writer:
+
+| Code | Name | Description |
+|------|------|-------------|
+| 8 | `YYJSON_WRITE_ERROR_DEPTH` | Nesting depth exceeded `YYJSON_WRITER_DEPTH_LIMIT`. |
+| 9 | `YYJSON_WRITE_ERROR_BUFFER_LIMIT` | The caller-provided working buffer is too small. |
+| 10 | `YYJSON_WRITE_ERROR_IO` | The output callback reported an I/O error. |
+
+### Flush, finish, and NDJSON
+
+```c
+bool yyjson_sw_flush(yyjson_sw *sw);
+bool yyjson_sw_finish(yyjson_sw *sw);
+bool yyjson_sw_doc_next(yyjson_sw *sw);
+```
+
+`flush()` pushes any buffered bytes out through the callback right away. Call it when the output needs to move along before the whole document is done, for example to keep a network connection alive. It has no effect in memory mode.
+
+`finish()` closes out the document: every container must already be closed, and it flushes any buffered bytes. Call it once, after the last value.
+
+For NDJSON, call `doc_next()` between documents, then `finish()` after the last one:
+
+```c
+for (size_t i = 0; i < count; i++) {
+    if (i > 0) yyjson_sw_doc_next(&writer);
+    write_one_line(&writer, &records[i]);
+}
+yyjson_sw_finish(&writer);
+```
+
+`doc_next()` writes the newline separator between two documents. It does not flush by itself.
+
+
+## Transform a stream
+
+`read_num()` / `read_scalar()` and `write_num()` / `write_scalar()` share the same `yyjson_val` type, so a reader and a writer can be used together to filter or reshape a JSON stream without ever building a DOM:
+
+```c
+yyjson_sr reader;
+yyjson_sw writer;
+
+yyjson_sr_init_fn(&reader, input_read, &input_ctx, in_buf, sizeof(in_buf), 0);
+yyjson_sw_init_fn(&writer, output_write, &output_ctx, out_buf, sizeof(out_buf), 0);
+
+yyjson_sv key;
+yyjson_sr_obj_begin(&reader);
+yyjson_sw_obj_begin(&writer);
+while (yyjson_sr_obj_next(&reader, &key)) {
+    if (!key_is_wanted(key)) {
+        yyjson_sr_skip_value(&reader);
+        continue;
+    }
+    yyjson_sw_write_key_sv(&writer, key);
+    yyjson_val val = yyjson_sr_read_scalar(&reader);
+    yyjson_sw_write_scalar(&writer, &val);
+}
+yyjson_sr_obj_end(&reader);
+yyjson_sw_obj_end(&writer);
+
+if (!yyjson_sr_finish(&reader)) { /* handle read error */ }
+if (!yyjson_sw_finish(&writer)) { /* handle write error */ }
+```
+
+Memory usage stays bounded by `in_buf` and `out_buf` alone, no matter how large the input or output is. See `test/test_json_sax.c` for a complete example that walks an object or array of unknown shape and produces SAX-style callbacks.
+
+
+## Limitations
+
+The streaming APIs trade full validation for bounded memory and single-pass I/O:
+
+- `yyjson_sr_skip_value()` does not fully validate what it skips. It only tracks string boundaries and bracket nesting, so malformed numbers, invalid escapes, invalid UTF-8, truncated literals, and mismatched brackets inside the skipped value go unnoticed. `arr_end()` / `obj_end()` skip any unread members the same way when closing a container, and so does `obj_find()` while passing over non-matching members. Because of this, `yyjson_sr_finish()` returning true only guarantees that the values actually read were valid, not that the whole input was; read every value with `yyjson_read()` instead of skipping when full validation is required.
+- `yyjson_sr_read_raw()` is not validated either: it returns the current scalar exactly as it appears in the input, without checking UTF-8 or escape sequences. The write side is the same: `yyjson_sw_write_raw()`, and a RAW `yyjson_val` passed to `yyjson_sw_write_scalar()`, are copied through unchanged with no validation or re-encoding.
+- Container nesting depth is limited by the working buffer as well as by `YYJSON_READER_DEPTH_LIMIT` / `YYJSON_WRITER_DEPTH_LIMIT`, since each open array or object holds a bit of the buffer for its container stack. A buffer sized for a shallower document can fail with `YYJSON_READ_ERROR_BUFFER_LIMIT` / `YYJSON_WRITE_ERROR_BUFFER_LIMIT` before reaching the depth limit; size the buffer for the expected depth with `YYJSON_SR_BUF_SIZE()` / `YYJSON_SW_BUF_SIZE()`.
 
 ---------------
 # Number Processing

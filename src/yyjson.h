@@ -50,18 +50,28 @@
 #endif
 
 /* Define as 1 to disable JSON incremental reader at compile-time.
-   This disables functions with "incr" in their name. */
+   This disables functions with "incr" in their name.
+   Reduces binary size by about 15%. */
 #ifndef YYJSON_DISABLE_INCR_READER
 #define YYJSON_DISABLE_INCR_READER 0
 #endif
 
-/* Define as 1 to disable file/fp read and write APIs. */
+/* Define as 1 to disable streaming reader/writer APIs at compile-time.
+   This disables functions with "sr" or "sw" in their name.
+   Reduces binary size by about 20%. */
+#ifndef YYJSON_DISABLE_STREAMING
+#define YYJSON_DISABLE_STREAMING 0
+#endif
+
+/* Define as 1 to disable file/fp read and write APIs.
+   Has little effect on binary size (about 1%). */
 #ifndef YYJSON_DISABLE_FILE
 #define YYJSON_DISABLE_FILE 0
 #endif
 
 /* Define as 1 to disable JSON Pointer, JSON Patch and JSON Merge Patch.
-   This disables functions with "ptr" or "patch" in their name. */
+   This disables functions with "ptr" or "patch" in their name.
+   Reduces binary size by about 5%. */
 #ifndef YYJSON_DISABLE_UTILS
 #define YYJSON_DISABLE_UTILS 0
 #endif
@@ -69,7 +79,7 @@
 /* Define as 1 to disable the fast floating-point number conversion in yyjson.
    Libc's `strtod/snprintf` will be used instead.
 
-   This reduces binary size by about 30%, but significantly slows down the
+   This reduces binary size by about 25%, but significantly slows down the
    floating-point read/write speed. */
 #ifndef YYJSON_DISABLE_FAST_FP_CONV
 #define YYJSON_DISABLE_FAST_FP_CONV 0
@@ -110,9 +120,16 @@
 /* auto detected in yyjson.c */
 #endif
 
-/* Define to an integer to set a depth limit for containers (arrays/objects). */
+/* Define to an integer to limit nested arrays/objects in the DOM and
+   streaming readers. 0 disables the policy limit. */
 #ifndef YYJSON_READER_DEPTH_LIMIT
 #define YYJSON_READER_DEPTH_LIMIT 0
+#endif
+
+/* Define to an integer to limit nested arrays/objects in the DOM and
+   streaming writers. 0 disables the policy limit. */
+#ifndef YYJSON_WRITER_DEPTH_LIMIT
+#define YYJSON_WRITER_DEPTH_LIMIT 0
 #endif
 
 /* Define as 1 to build without libc (stdlib, string, math, stdio).
@@ -353,6 +370,14 @@
 /** Used to cast away (remove) const qualifier. */
 #ifndef yyjson_constcast
 #   define yyjson_constcast(type) (type)(void *)(size_t)(const void *)
+#endif
+
+/** Macros for min and max. The arguments should have no side effects. */
+#ifndef yyjson_min
+#   define yyjson_min(x, y) ((x) < (y) ? (x) : (y))
+#endif
+#ifndef yyjson_max
+#   define yyjson_max(x, y) ((x) > (y) ? (x) : (y))
 #endif
 
 /** Microsoft Visual C++ 6.0 doesn't support converting number from u64 to f64:
@@ -645,7 +670,7 @@ typedef uint8_t yyjson_subtype;
 #define YYJSON_TAG_BIT          ((uint8_t)8)
 
 /** Padding size for JSON reader. */
-#define YYJSON_PADDING_SIZE     4
+#define YYJSON_PADDING_SIZE     8
 
 
 
@@ -812,8 +837,8 @@ static const yyjson_read_flag YYJSON_READ_NOFLAG                    = 0;
     This option allows the reader to modify and use input data to store string
     values, which can increase reading speed slightly.
     The caller should hold the input data before freeing the document.
-    The input data must be padded by at least `YYJSON_PADDING_SIZE` bytes.
-    For example: `[1,2]` should be `[1,2]\0\0\0\0`, input length should be 5. */
+    The input data must be followed by at least `YYJSON_PADDING_SIZE` readable
+    zero bytes, while the input length remains unchanged. */
 static const yyjson_read_flag YYJSON_READ_INSITU                    = 1 << 0;
 
 /** Stop when done instead of issuing an error if there's additional content
@@ -953,6 +978,12 @@ static const yyjson_read_code YYJSON_READ_ERROR_MORE                    = 14;
 
 /** Read depth limit exceeded. */
 static const yyjson_read_code YYJSON_READ_ERROR_DEPTH                   = 15;
+
+/** A selected string or number exceeds the streaming reader buffer. */
+static const yyjson_read_code YYJSON_READ_ERROR_BUFFER_LIMIT            = 16;
+
+/** Streaming input callback failed. */
+static const yyjson_read_code YYJSON_READ_ERROR_IO                      = 17;
 
 /** Error information for JSON reader. */
 typedef struct yyjson_read_err {
@@ -1184,7 +1215,7 @@ yyjson_api_inline size_t yyjson_read_max_memory_usage(size_t len,
      */
     size_t mul = (size_t)12 + !(flg & YYJSON_READ_INSITU);
     size_t pad = 256;
-    size_t max = (size_t)(~(size_t)0);
+    size_t max = ~(size_t)0;
     if (flg & YYJSON_READ_STOP_WHEN_DONE) len = len < 256 ? 256 : len;
     if (len >= (max - pad - mul) / mul) return 0;
     return len * mul + pad;
@@ -1329,6 +1360,15 @@ static const yyjson_write_code YYJSON_WRITE_ERROR_FILE_WRITE            = 6;
 
 /** Invalid unicode in string. */
 static const yyjson_write_code YYJSON_WRITE_ERROR_INVALID_STRING        = 7;
+
+/** Nesting depth limit exceeded. */
+static const yyjson_write_code YYJSON_WRITE_ERROR_DEPTH                 = 8;
+
+/** Streaming writer buffer is too small. */
+static const yyjson_write_code YYJSON_WRITE_ERROR_BUFFER_LIMIT          = 9;
+
+/** Streaming output callback failed. */
+static const yyjson_write_code YYJSON_WRITE_ERROR_IO                    = 10;
 
 /** Error information for JSON writer. */
 typedef struct yyjson_write_err {
@@ -4948,6 +4988,627 @@ yyjson_api yyjson_mut_val *yyjson_mut_merge_patch(yyjson_mut_doc *doc,
 
 
 
+#if !YYJSON_DISABLE_STREAMING
+
+/*==============================================================================
+ * MARK: - Streaming JSON API
+ *============================================================================*/
+
+/** A non-owning string view. */
+typedef struct yyjson_sv {
+    const char *ptr; /**< string pointer, may be NULL */
+    size_t len;      /**< string length in bytes */
+} yyjson_sv;
+
+/** Creates and returns a string view.
+    The input string is not copied or validated. */
+yyjson_api_inline yyjson_sv yyjson_sv_make(const char *str, size_t len) {
+    yyjson_sv sv; sv.ptr = str; sv.len = len; return sv;
+}
+
+/** Returns whether the view equals a string.
+    The `str` should be a UTF-8 string, null-terminator is not required. */
+yyjson_api_inline bool yyjson_sv_equals_strn(yyjson_sv sv, const char *str,
+                                             size_t len) {
+    return str && sv.ptr && sv.len == len && !memcmp(sv.ptr, str, len);
+}
+
+/** Returns whether the view equals a string.
+    The `str` should be a null-terminated UTF-8 string. */
+yyjson_api_inline bool yyjson_sv_equals_str(yyjson_sv sv, const char *str) {
+    size_t len = str ? strlen(str) : 0;
+    return yyjson_sv_equals_strn(sv, str, len);
+}
+
+
+#if !YYJSON_DISABLE_READER
+
+/*==============================================================================
+ * MARK: - Streaming Reader API
+ *============================================================================*/
+
+/** Internal streaming reader window bounds (do not modify). */
+#define YYJSON_SR_MIN_WINDOW ((size_t)1 << 10)  /* 1 KB */
+#define YYJSON_SR_MAX_WINDOW ((size_t)64 << 10) /* 64 KB */
+
+/**
+ Returns a reader buffer size that guarantees the specified limits.
+
+ @param val_len The maximum JSON length of a selected string, key, or number.
+ @param depth The maximum number of containers entered at once.
+ @return A buffer size that guarantees these limits; larger values may work.
+
+ Arguments should have no side effects and stay below `SIZE_MAX / 2`.
+ */
+#define YYJSON_SR_BUF_SIZE(val_len, depth) \
+    (yyjson_max((size_t)(val_len) + (size_t)(depth) + YYJSON_PADDING_SIZE, \
+                YYJSON_SR_MIN_WINDOW) + \
+     yyjson_min(yyjson_max((size_t)(val_len) + (size_t)(depth) + \
+                           YYJSON_PADDING_SIZE, YYJSON_SR_MIN_WINDOW), \
+                YYJSON_SR_MAX_WINDOW))
+
+/** Smallest accepted reader buffer size. */
+#define YYJSON_SR_MIN_BUF YYJSON_SR_BUF_SIZE(0, 0)
+
+/** Recommended buffer size; guarantees a 16 KB value at depth 1024. */
+#define YYJSON_SR_DEF_BUF YYJSON_SR_BUF_SIZE(16384, 1024)
+
+/**
+ Input callback for the streaming reader.
+
+ @param ctx The user context.
+ @param dst The output buffer to fill.
+ @param cap The maximum number of bytes to write.
+ @return The number of bytes written,
+    `0` for clean end-of-input, or `((size_t)-1)` on I/O error.
+ */
+typedef size_t (*yyjson_sr_read_fn)(void *ctx, void *dst, size_t cap);
+
+/**
+ A streaming JSON reader.
+
+ Initialize with `yyjson_sr_init_*()`. No destroy or free is needed.
+ Fields are private; use public APIs to access it.
+ */
+typedef struct yyjson_sr yyjson_sr;
+
+
+
+/**
+ Initialize a streaming reader from memory.
+
+ This function does not allocate memory. Only standard JSON is supported.
+
+ @param sr The streaming reader.
+    If `sr` is NULL, returns false.
+ @param src The JSON data (UTF-8 without BOM), null-terminator is not required.
+    If `src` is NULL, returns false.
+    With `YYJSON_READ_INSITU`, `src` and `YYJSON_PADDING_SIZE` bytes after it
+    must be writable. Otherwise, `src` is not modified.
+ @param len The length of JSON data in bytes.
+ @param buf The caller-owned working buffer, separate from `src`.
+    If `buf` is NULL or too small, returns false.
+    Use `YYJSON_SR_DEF_BUF` or `YYJSON_SR_BUF_SIZE()`. In in-situ mode,
+    `buf_cap` is the entered-container depth capacity.
+ @param buf_cap The capacity of `buf` in bytes.
+ @param flg The JSON read options.
+    Multiple options can be combined with `|` operator. 0 means no options.
+    Supports `YYJSON_READ_INSITU`, `YYJSON_READ_NUMBER_AS_RAW`,
+    `YYJSON_READ_BIGNUM_AS_RAW`, and `YYJSON_READ_ALLOW_INVALID_UNICODE`.
+    Flags that would accept non-standard JSON are ignored, so comments,
+    trailing commas, `Infinity`, `NaN`, and BOM are always rejected.
+ @return true if successful, false if an error occurs.
+ */
+yyjson_api bool yyjson_sr_init_mem(yyjson_sr *sr, char *src, size_t len,
+                                   void *buf, size_t buf_cap,
+                                   yyjson_read_flag flg);
+
+/**
+ Initialize a streaming reader from a pull callback.
+
+ This function does not allocate memory. Only standard JSON is supported.
+
+ @param sr The streaming reader.
+    If `sr` is NULL, returns false.
+ @param fn The input callback (see `yyjson_sr_read_fn`).
+    If `fn` is NULL, returns false.
+ @param ctx The user context passed to `fn`.
+ @param buf The caller-owned working buffer.
+    If `buf` is NULL or too small, returns false.
+    Use `YYJSON_SR_DEF_BUF` unless a different size is needed.
+ @param buf_cap The capacity of `buf` in bytes.
+ @param flg The JSON read options.
+    Multiple options can be combined with `|` operator. 0 means no options.
+    Supports `YYJSON_READ_NUMBER_AS_RAW`, `YYJSON_READ_BIGNUM_AS_RAW`, and
+    `YYJSON_READ_ALLOW_INVALID_UNICODE`.
+    Flags that would accept non-standard JSON are ignored, so comments,
+    trailing commas, `Infinity`, `NaN`, and BOM are always rejected.
+ @return true if successful, false if an error occurs.
+ */
+yyjson_api bool yyjson_sr_init_fn(yyjson_sr *sr,
+                                  yyjson_sr_read_fn fn, void *ctx,
+                                  void *buf, size_t buf_cap,
+                                  yyjson_read_flag flg);
+
+#if !YYJSON_FREESTANDING && !YYJSON_DISABLE_FILE
+
+/**
+ Initialize a streaming reader from a file pointer.
+
+ This function does not allocate memory or close the file.
+ Only standard JSON is supported.
+
+ @param sr The streaming reader.
+    If `sr` is NULL, returns false.
+ @param fp The file pointer.
+    The data will be read from the current position of the FILE to the end.
+    If `fp` is NULL or invalid, returns false.
+ @param buf The caller-owned working buffer.
+    If `buf` is NULL or too small, returns false.
+    Use `YYJSON_SR_DEF_BUF` unless a different size is needed.
+ @param buf_cap The capacity of `buf` in bytes.
+ @param flg The JSON read options.
+    Multiple options can be combined with `|` operator. 0 means no options.
+    Supports `YYJSON_READ_NUMBER_AS_RAW`, `YYJSON_READ_BIGNUM_AS_RAW`, and
+    `YYJSON_READ_ALLOW_INVALID_UNICODE`.
+    Flags that would accept non-standard JSON are ignored, so comments,
+    trailing commas, `Infinity`, `NaN`, and BOM are always rejected.
+ @return true if successful, false if an error occurs.
+ */
+yyjson_api bool yyjson_sr_init_fp(yyjson_sr *sr, FILE *fp,
+                                  void *buf, size_t buf_cap,
+                                  yyjson_read_flag flg);
+
+#endif /* !YYJSON_FREESTANDING && !YYJSON_DISABLE_FILE */
+
+
+
+/** Returns whether no error has occurred.
+    Returns false if `sr` is NULL. */
+yyjson_api_inline bool yyjson_sr_ok(const yyjson_sr *sr);
+
+/**
+ Get the sticky error information.
+
+ @param sr The streaming reader.
+    If `sr` is NULL, returns `YYJSON_READ_ERROR_INVALID_PARAMETER`.
+ @param err A pointer to receive error information (NULL if you don't need).
+ @return `YYJSON_READ_SUCCESS` if no error, or an error code.
+ @note `err->pos` shares the DOM reader's `yyjson_read_err`, so it is a
+    `size_t`. Where a stream can be longer than `SIZE_MAX`, an error past that
+    point saturates at `SIZE_MAX`; use `yyjson_sr_pos()` for the exact offset.
+ */
+yyjson_api_inline yyjson_read_code yyjson_sr_get_err(const yyjson_sr *sr,
+                                                     yyjson_read_err *err);
+
+/** Returns the byte offset from the start of the input.
+    This is a `uint64_t`, so it is exact even on a 32-bit target.
+    Returns 0 if `sr` is NULL. */
+yyjson_api_inline uint64_t yyjson_sr_pos(const yyjson_sr *sr);
+
+/** Returns the type of the current value without consuming it.
+    Returns `YYJSON_TYPE_NONE` if there is no current value or on error.
+    Use arr_next/obj_next to detect container end, not this function. */
+yyjson_api_inline yyjson_type yyjson_sr_peek_type(yyjson_sr *sr);
+
+/** Begin reading an array (consume `[`).
+    Returns false if the current value is not an array or on error. */
+yyjson_api_inline bool yyjson_sr_arr_begin(yyjson_sr *sr);
+
+/**
+ Move to the next array element.
+
+ @return true if an element is available, false at `]` or on error.
+    After true, consume the value before calling again.
+    After a clean false, call `yyjson_sr_arr_end()`.
+ @note This function checks the separators around an element, not the element
+    itself. A true return means the array has not ended, so the value is read
+    or skipped next; it does not promise that a well-formed value follows.
+    Malformed input may therefore be reported by that following call rather
+    than here, and `yyjson_sr_finish()` always reports it.
+ */
+yyjson_api_inline bool yyjson_sr_arr_next(yyjson_sr *sr);
+
+/** End reading an array (consume `]`).
+    Unread elements are skipped, see `yyjson_sr_skip_value()` for the
+    validation caveat. Must pair with a successful arr_begin.
+    Returns false on error. */
+yyjson_api_inline bool yyjson_sr_arr_end(yyjson_sr *sr);
+
+/** Begin reading an object (consume `{`).
+    Returns false if the current value is not an object or on error. */
+yyjson_api_inline bool yyjson_sr_obj_begin(yyjson_sr *sr);
+
+/**
+ Move to the next object member.
+
+ @param sr The streaming reader.
+ @param key A pointer to receive the key on success.
+ @return true if a member is available, false at `}` or on error.
+    After true, consume the value before calling again.
+    After a clean false, call `yyjson_sr_obj_end()`.
+ @note The key is valid only until the next `yyjson_sr_*` call.
+ */
+yyjson_api bool yyjson_sr_obj_next(yyjson_sr *sr, yyjson_sv *key);
+
+/** Finds an object member by a null-terminated key (forward-only).
+    Skips non-matching members, see `yyjson_sr_skip_value()` for the validation
+    caveat. A clean miss returns false without consuming `}` or setting an
+    error. After true, consume the value before navigating. */
+yyjson_api_inline bool yyjson_sr_obj_find(yyjson_sr *sr, const char *key);
+
+/** Finds an object member by a key with explicit length (forward-only).
+    Skips non-matching members, see `yyjson_sr_skip_value()` for the validation
+    caveat. A clean miss returns false without consuming `}` or setting an
+    error. After true, consume the value before navigating. */
+yyjson_api_inline bool yyjson_sr_obj_findn(yyjson_sr *sr, const char *key,
+                                           size_t key_len);
+
+/** End reading an object (consume `}`).
+    Unread members are skipped, see `yyjson_sr_skip_value()` for the
+    validation caveat. Must pair with a successful obj_begin.
+    Returns false on error. */
+yyjson_api_inline bool yyjson_sr_obj_end(yyjson_sr *sr);
+
+
+
+/** Returns the current value as a string.
+    Returns `{NULL, 0}` on error. The view is null-terminated and valid only
+    until the next `yyjson_sr_*` call. */
+yyjson_api_inline yyjson_sv yyjson_sr_read_str(yyjson_sr *sr);
+
+/** Returns the current number as uint64_t.
+    Returns 0 on error. */
+yyjson_api_inline uint64_t yyjson_sr_read_uint(yyjson_sr *sr);
+
+/** Returns the current number as int64_t.
+    Returns 0 on error. */
+yyjson_api_inline int64_t yyjson_sr_read_sint(yyjson_sr *sr);
+
+/** Returns the current number as double.
+    Returns 0.0 on error. */
+yyjson_api_inline double yyjson_sr_read_real(yyjson_sr *sr);
+
+/** Returns the current boolean value.
+    Both JSON `false` and an error return false; use `yyjson_sr_ok()`. */
+yyjson_api_inline bool yyjson_sr_read_bool(yyjson_sr *sr);
+
+/** Reads a `null` value.
+    On error, sets a sticky error; use `yyjson_sr_ok()`. */
+yyjson_api_inline void yyjson_sr_read_null(yyjson_sr *sr);
+
+/** Returns the current scalar as raw JSON bytes.
+    Returns `{NULL, 0}` on error. Arrays and objects are rejected. The view may
+    not be null-terminated and is valid only until the next `yyjson_sr_*` call.
+    UTF-8 and escapes are not validated. */
+yyjson_api yyjson_sv yyjson_sr_read_raw(yyjson_sr *sr);
+
+/** Returns the current number as a standalone `yyjson_val`.
+    The result may be RAW when a number-as-raw flag is enabled. RAW data is
+    valid only until the next `yyjson_sr_*` call.
+    Returns type `YYJSON_TYPE_NONE` on error. */
+yyjson_api_inline yyjson_val yyjson_sr_read_num(yyjson_sr *sr);
+
+/** Returns the current scalar as a standalone `yyjson_val`.
+    Arrays and objects are rejected. A string or RAW number is valid only until
+    the next `yyjson_sr_*` call. Returns type `YYJSON_TYPE_NONE` on error. */
+yyjson_api_inline yyjson_val yyjson_sr_read_scalar(yyjson_sr *sr);
+
+/** Skips the current value.
+    Returns false on error.
+    @warning Skipped content is not validated. Only string boundaries and
+        bracket nesting are tracked, so malformed numbers, invalid escapes,
+        invalid UTF-8, truncated literals, and mismatched brackets inside the
+        skipped region are accepted. A document accepted while skipping is not
+        guaranteed to be accepted by `yyjson_read()` or by any other parser. */
+yyjson_api_inline bool yyjson_sr_skip_value(yyjson_sr *sr);
+
+
+
+/** Finds a required object member and returns it as a real number.
+    Returns 0.0 and sets a sticky error if the member is missing or invalid. */
+yyjson_api_inline double yyjson_sr_obj_read_real(yyjson_sr *sr,
+                                                 const char *key);
+
+/** Finds a required object member and returns it as an unsigned integer.
+    Returns 0 and sets a sticky error if the member is missing or invalid. */
+yyjson_api_inline uint64_t yyjson_sr_obj_read_uint(yyjson_sr *sr,
+                                                   const char *key);
+
+/** Finds a required object member and returns it as a signed integer.
+    Returns 0 and sets a sticky error if the member is missing or invalid. */
+yyjson_api_inline int64_t yyjson_sr_obj_read_sint(yyjson_sr *sr,
+                                                  const char *key);
+
+/** Finds a required object member and returns it as a string.
+    Returns `{NULL, 0}` and sets a sticky error if missing or invalid. The view
+    is valid only until the next `yyjson_sr_*` call. */
+yyjson_api_inline yyjson_sv yyjson_sr_obj_read_str(yyjson_sr *sr,
+                                                   const char *key);
+
+/** Finds a required object member and returns it as a boolean.
+    Both JSON `false` and an error return false; use `yyjson_sr_ok()`. */
+yyjson_api_inline bool yyjson_sr_obj_read_bool(yyjson_sr *sr,
+                                               const char *key);
+
+/** Finds and reads a required object member whose value is `null`.
+    A missing or invalid member sets a sticky error. */
+yyjson_api_inline void yyjson_sr_obj_read_null(yyjson_sr *sr,
+                                               const char *key);
+
+
+
+/** Finishes reading a single-root document.
+    All containers must be closed; only whitespace may remain.
+    Returns false on error. */
+yyjson_api bool yyjson_sr_finish(yyjson_sr *sr);
+
+/** Moves to the next root in NDJSON or concatenated JSON.
+    Returns true if a root is available, false at clean end-of-input or on
+    error; use `yyjson_sr_ok()` to distinguish them. */
+yyjson_api bool yyjson_sr_doc_next(yyjson_sr *sr);
+
+#endif /* !YYJSON_DISABLE_READER */
+
+
+
+/*==============================================================================
+ * MARK: - Streaming Writer API
+ *============================================================================*/
+
+#if !YYJSON_DISABLE_WRITER
+
+/** Smallest accepted stream or file writer buffer. */
+#define YYJSON_SW_MIN_BUF ((size_t)64)
+
+/** Recommended streaming writer working buffer size (16 KB).
+    A larger buffer may reduce the number of output callback calls. */
+#define YYJSON_SW_DEF_BUF ((size_t)16 << 10)
+
+/**
+ Returns a writer buffer size that guarantees the specified depth.
+
+ @param depth The maximum number of open containers.
+ @return A buffer size that guarantees this depth; larger depths may work.
+
+ The argument should have no side effects and stay below `SIZE_MAX / 2`.
+ */
+#define YYJSON_SW_BUF_SIZE(depth) \
+    ((size_t)(depth) + YYJSON_SW_MIN_BUF)
+
+/**
+ Output callback for the streaming writer.
+
+ @param ctx The user context.
+ @param src The bytes to write.
+ @param len The number of bytes; the callback must consume all of them.
+ @return true if successful, false if an error occurs.
+ */
+typedef bool (*yyjson_sw_write_fn)(void *ctx, const void *src, size_t len);
+
+/**
+ A streaming JSON writer.
+
+ Initialize with `yyjson_sw_init_*()`. No destroy or free is needed.
+ Fields are private; use public APIs to access it.
+ */
+typedef struct yyjson_sw yyjson_sw;
+
+
+
+/**
+ Initialize a streaming writer to memory.
+
+ This function does not allocate memory. The JSON is written to `dst` without
+ a null terminator. Use `yyjson_sw_len()` to get its length.
+
+ @param sw The streaming writer.
+    If `sw` is NULL, returns false.
+ @param dst The caller-owned output buffer.
+    If `dst` is NULL, returns false.
+ @param dst_cap The capacity of `dst` in bytes.
+    If `dst_cap` is 0, returns false.
+    A capacity equal to the complete encoded output length is sufficient.
+ @param flg The JSON write options.
+    Multiple options can be combined with `|` operator. 0 means no options.
+    Flags that would emit non-standard JSON are ignored, so `Infinity` and
+    `NaN` are always rejected; use `YYJSON_WRITE_INF_AND_NAN_AS_NULL` to
+    write them as `null` instead.
+ @return true if successful, false if an error occurs.
+ */
+yyjson_api bool yyjson_sw_init_mem(yyjson_sw *sw, void *dst, size_t dst_cap,
+                                   yyjson_write_flag flg);
+
+/**
+ Initialize a streaming writer from a push callback.
+
+ This function does not allocate memory.
+
+ @param sw The streaming writer.
+    If `sw` is NULL, returns false.
+ @param fn The output callback (see `yyjson_sw_write_fn`).
+    If `fn` is NULL, returns false.
+ @param ctx The user context passed to `fn`.
+ @param buf The caller-owned working buffer, separate from the output sink.
+    If `buf` is NULL or too small, returns false.
+    Use `YYJSON_SW_DEF_BUF` or `YYJSON_SW_BUF_SIZE()`.
+ @param buf_cap The capacity of `buf` in bytes.
+ @param flg The JSON write options.
+    Multiple options can be combined with `|` operator. 0 means no options.
+    Flags that would emit non-standard JSON are ignored, so `Infinity` and
+    `NaN` are always rejected; use `YYJSON_WRITE_INF_AND_NAN_AS_NULL` to
+    write them as `null` instead.
+ @return true if successful, false if an error occurs.
+ */
+yyjson_api bool yyjson_sw_init_fn(yyjson_sw *sw,
+                                  yyjson_sw_write_fn fn, void *ctx,
+                                  void *buf, size_t buf_cap,
+                                  yyjson_write_flag flg);
+
+#if !YYJSON_FREESTANDING && !YYJSON_DISABLE_FILE
+
+/**
+ Initialize a streaming writer to a file pointer.
+
+ This function does not allocate memory or close the file.
+
+ @param sw The streaming writer.
+    If `sw` is NULL, returns false.
+ @param fp The file pointer.
+    The data will be written to the current position of the file.
+    If `fp` is NULL or invalid, returns false.
+ @param buf The caller-owned working buffer, separate from the output file.
+    If `buf` is NULL or too small, returns false.
+    Use `YYJSON_SW_DEF_BUF` unless a different size is needed.
+ @param buf_cap The capacity of `buf` in bytes.
+ @param flg The JSON write options.
+    Multiple options can be combined with `|` operator. 0 means no options.
+    Flags that would emit non-standard JSON are ignored, so `Infinity` and
+    `NaN` are always rejected; use `YYJSON_WRITE_INF_AND_NAN_AS_NULL` to
+    write them as `null` instead.
+ @return true if successful, false if an error occurs.
+ */
+yyjson_api bool yyjson_sw_init_fp(yyjson_sw *sw, FILE *fp,
+                                  void *buf, size_t buf_cap,
+                                  yyjson_write_flag flg);
+
+#endif /* !YYJSON_FREESTANDING && !YYJSON_DISABLE_FILE */
+
+
+
+/** Returns whether no error has occurred.
+    Returns false if `sw` is NULL. */
+yyjson_api_inline bool yyjson_sw_ok(const yyjson_sw *sw);
+
+/**
+ Get the sticky error information.
+
+ @param sw The streaming writer.
+    If `sw` is NULL, returns `YYJSON_WRITE_ERROR_INVALID_PARAMETER`.
+ @param err A pointer to receive error information.
+    Pass NULL if you don't need error information.
+ @return `YYJSON_WRITE_SUCCESS` if no error, or an error code.
+ */
+yyjson_api_inline yyjson_write_code yyjson_sw_get_err(const yyjson_sw *sw,
+                                                      yyjson_write_err *err);
+
+/** Returns the total number of bytes produced since initialization.
+    The result includes flushed bytes and is independent of output mode.
+    Returns 0 if `sw` is NULL. */
+yyjson_api_inline uint64_t yyjson_sw_len(const yyjson_sw *sw);
+
+/** Begins writing an array (`[`). Returns false on error. */
+yyjson_api_inline bool yyjson_sw_arr_begin(yyjson_sw *sw);
+
+/** Ends writing an array (`]`). Returns false on error. */
+yyjson_api_inline bool yyjson_sw_arr_end(yyjson_sw *sw);
+
+/** Begins writing an object (`{`). Returns false on error. */
+yyjson_api_inline bool yyjson_sw_obj_begin(yyjson_sw *sw);
+
+/** Ends writing an object (`}`). Returns false on error. */
+yyjson_api_inline bool yyjson_sw_obj_end(yyjson_sw *sw);
+
+/** Writes an object key. Exactly one value must follow.
+    The `key` should be a UTF-8 string, null-terminator is not required.
+    Returns false on error. */
+yyjson_api_inline bool yyjson_sw_write_keyn(yyjson_sw *sw, const char *key,
+                                            size_t len);
+
+/** Writes an object key. Exactly one value must follow.
+    The `key` should be a null-terminated UTF-8 string.
+    Returns false on error. */
+yyjson_api_inline bool yyjson_sw_write_key(yyjson_sw *sw, const char *key) {
+    return yyjson_sw_write_keyn(sw, key, key ? strlen(key) : 0);
+}
+
+/** Writes an object key from a string view. Exactly one value must follow.
+    Returns false on error. */
+yyjson_api_inline bool yyjson_sw_write_key_sv(yyjson_sw *sw, yyjson_sv key) {
+    return yyjson_sw_write_keyn(sw, key.ptr, key.len);
+}
+
+/** Writes a string value.
+    The `str` should be a UTF-8 string, null-terminator is not required.
+    Returns false on error. */
+yyjson_api_inline bool yyjson_sw_write_strn(yyjson_sw *sw, const char *str,
+                                            size_t len);
+
+/** Writes a string value.
+    The `str` should be a null-terminated UTF-8 string.
+    Returns false on error. */
+yyjson_api_inline bool yyjson_sw_write_str(yyjson_sw *sw, const char *str) {
+    return yyjson_sw_write_strn(sw, str, str ? strlen(str) : 0);
+}
+
+/** Writes a string value from a string view. Returns false on error. */
+yyjson_api_inline bool yyjson_sw_write_sv(yyjson_sw *sw, yyjson_sv sv) {
+    return yyjson_sw_write_strn(sw, sv.ptr, sv.len);
+}
+
+/** Writes an unsigned integer. Returns false on error. */
+yyjson_api bool yyjson_sw_write_uint(yyjson_sw *sw, uint64_t val);
+
+/** Writes a signed integer. Returns false on error. */
+yyjson_api bool yyjson_sw_write_sint(yyjson_sw *sw, int64_t val);
+
+/** Writes a real number (double). Returns false on error. */
+yyjson_api bool yyjson_sw_write_real(yyjson_sw *sw, double val);
+
+/** Writes a boolean value. Returns false on error. */
+yyjson_api_inline bool yyjson_sw_write_bool(yyjson_sw *sw, bool val);
+
+/** Writes a `null` value. Returns false on error. */
+yyjson_api_inline bool yyjson_sw_write_null(yyjson_sw *sw);
+
+/** Writes a UINT, SINT, or REAL number from a `yyjson_val`.
+    The value may come from a DOM or `yyjson_sr_read_num()`. RAW is rejected;
+    use `yyjson_sw_write_scalar()` to forward a RAW number.
+    Returns false on error. */
+yyjson_api bool yyjson_sw_write_num(yyjson_sw *sw, const yyjson_val *num);
+
+/** Writes a null, boolean, number, string, or raw value.
+    Arrays and objects are rejected. The value may come from a DOM or
+    `yyjson_sr_read_scalar()`. RAW is not validated.
+    Returns false on error. */
+yyjson_api bool yyjson_sw_write_scalar(yyjson_sw *sw, const yyjson_val *val);
+
+/** Writes a raw JSON value without validation or escaping.
+    The input must be one complete JSON value, same as `yyjson_mut_raw()`.
+    The `raw` should be a string, null-terminator is not required.
+    Returns false on error. */
+yyjson_api bool yyjson_sw_write_rawn(yyjson_sw *sw, const char *raw,
+                                     size_t len);
+
+/** Writes a raw JSON value without validation or escaping.
+    The input must be one complete JSON value, same as `yyjson_mut_raw()`.
+    The `raw` should be a null-terminated string. Returns false on error. */
+yyjson_api_inline bool yyjson_sw_write_raw(yyjson_sw *sw, const char *raw) {
+    return yyjson_sw_write_rawn(sw, raw, raw ? strlen(raw) : 0);
+}
+
+
+
+/** Flushes buffered bytes to the callback.
+    This controls output latency and is a no-op in memory mode. The callback
+    must still consume all bytes. Returns false on error. */
+yyjson_api bool yyjson_sw_flush(yyjson_sw *sw);
+
+/** Finishes the final root value.
+    All containers must be closed. May append a final newline and flush.
+    Returns false on error. */
+yyjson_api bool yyjson_sw_finish(yyjson_sw *sw);
+
+/** Starts another root after a complete value (NDJSON).
+    Another root must be written before finish. Returns false on error. */
+yyjson_api bool yyjson_sw_doc_next(yyjson_sw *sw);
+
+#endif /* !YYJSON_DISABLE_WRITER */
+
+#endif /* YYJSON_DISABLE_STREAMING */
+
+
+
 /*==============================================================================
  * MARK: - JSON Structure (Implementation)
  *============================================================================*/
@@ -8351,7 +9012,7 @@ yyjson_api_inline bool yyjson_ptr_get_str(
 
 
 /*==============================================================================
- * MARK: - Deprecated
+ * MARK: - JSON Pointer API (Deprecated)
  *============================================================================*/
 
 /** @deprecated renamed to `yyjson_doc_ptr_get` */
@@ -8431,6 +9092,1218 @@ yyjson_api_inline yyjson_mut_val *unsafe_yyjson_mut_get_pointer(
 }
 
 #endif /* YYJSON_DISABLE_UTILS */
+
+
+
+#if !YYJSON_DISABLE_STREAMING
+
+/*==============================================================================
+ * MARK: - Streaming JSON (Implementation)
+ *============================================================================*/
+
+/* Internal helpers used by the public inline streaming APIs. */
+#define YYJSON_WORD_01      ((~(size_t)0) / 0xFF)   /* 0x01010101... */
+#define YYJSON_WORD_80      (YYJSON_WORD_01 * 0x80) /* 0x80808080... */
+#define YYJSON_WORD_REP(b)  (YYJSON_WORD_01 * (size_t)(uint8_t)(b))
+
+yyjson_api_inline size_t yyjson_impl_word_load(const void *p) {
+    size_t w; memcpy(&w, p, sizeof(w)); return w;
+}
+
+yyjson_api_inline size_t yyjson_impl_word_has_zero(size_t w) {
+    return (w - YYJSON_WORD_01) & ~w & YYJSON_WORD_80;
+}
+
+yyjson_api_inline size_t yyjson_impl_word_has_byte(size_t w, uint8_t b) {
+    return yyjson_impl_word_has_zero(w ^ YYJSON_WORD_REP(b));
+}
+
+yyjson_api_inline size_t yyjson_impl_word_has_ctrl(size_t w) {
+    return (w - YYJSON_WORD_REP(0x20)) & ~w & YYJSON_WORD_80;
+}
+
+yyjson_api_inline size_t yyjson_impl_word_has_esc(size_t w) {
+    size_t ascii_mask = YYJSON_WORD_80 & ~w;
+    size_t quote_or_ctrl = (w ^ YYJSON_WORD_REP(0x02)) - YYJSON_WORD_REP(0x21);
+    size_t backslash = (w ^ YYJSON_WORD_REP('\\')) - YYJSON_WORD_01;
+    return (quote_or_ctrl | backslash) & ascii_mask; /* `< 0x20`, `"`, `\` */
+}
+
+#if !YYJSON_DISABLE_READER
+
+/**
+ Streaming JSON reader.
+ Normal buffer: [win <= cur <= end][tmp --> <-- stk].
+ Insitu buffer: [tmp --> <-- stk].
+ */
+struct yyjson_sr {
+    const uint8_t *cur;     /**< read cursor (next unconsumed) */
+    const uint8_t *end;     /**< end of current window */
+    uint8_t *win;           /**< window base (insitu: the input itself) */
+    size_t win_cap;         /**< window capacity (including padding) */
+    uint8_t *tmp;           /**< scratch: decoded strings and raw */
+    uint8_t *stk;           /**< container stack top */
+
+    yyjson_sr_read_fn fn;   /**< pull callback (insitu: NULL) */
+    void *ctx;              /**< user context for `fn` */
+    const uint8_t *mem_cur; /**< memory-mode read cursor (mem only) */
+    const uint8_t *mem_end; /**< memory-mode read end (mem only) */
+
+    uint64_t ofs;           /**< input offset before current window */
+    size_t depth;           /**< entered container depth */
+    size_t max_depth;       /**< container depth capacity */
+    yyjson_read_flag flg;   /**< read options from init */
+    yyjson_read_err err;    /**< first error */
+
+    uint8_t st;             /**< value slot state, see `YYJSON_SR_ST_*` */
+    bool fail;              /**< sticky error flag */
+    bool eof;               /**< EOF reached */
+};
+
+/*
+ State of the value slot at the current level (container or document).
+
+ A navigation call (`arr_next`, `obj_next`, `obj_find`, `doc_next`) moves the
+ slot to HELD, and a consumer (any `read_*`, `skip_value`, or entering a
+ container) moves it to DONE. Navigating while the slot is still HELD means the
+ caller skipped the consumer, which is reported instead of silently re-exposing
+ the same value.
+
+ The state is not stacked: entering a container resets it to NONE, and leaving
+ one sets DONE, because the container itself is a consumed value in its parent.
+ */
+#define YYJSON_SR_ST_NONE 0 /* no value has been exposed at this level */
+#define YYJSON_SR_ST_HELD 1 /* a value is exposed and not yet consumed */
+#define YYJSON_SR_ST_DONE 2 /* the last value was consumed (needs a comma) */
+
+#define YYJSON_SR_SKIP_CTN 0 /* container */
+#define YYJSON_SR_SKIP_STR 1 /* string */
+#define YYJSON_SR_SKIP_ESC 2 /* escape */
+#define YYJSON_SR_SKIP_RAW 3 /* unquoted raw token */
+
+#define YYJSON_SR_NUM_ANY  0 /* any number type */
+#define YYJSON_SR_NUM_UINT 1 /* unsigned integer */
+#define YYJSON_SR_NUM_SINT 2 /* signed integer */
+#define YYJSON_SR_NUM_REAL 3 /* to double */
+
+/** Private skip state when a value crosses a window boundary. */
+typedef struct yyjson_sr_skip_state {
+    size_t depth; /**< open containers (`[` / `{`) */
+    uint8_t mode; /**< see `YYJSON_SR_SKIP_XXX` */
+} yyjson_sr_skip_state;
+
+yyjson_api void yyjson_impl_sr_set_err(yyjson_sr *sr, yyjson_read_code code,
+                                       const char *msg);
+yyjson_api yyjson_type yyjson_impl_sr_peek_type(yyjson_sr *sr);
+yyjson_api bool yyjson_impl_sr_ctn_begin_slow(yyjson_sr *sr, uint8_t token);
+yyjson_api bool yyjson_impl_sr_ctn_end_slow(yyjson_sr *sr, uint8_t token);
+yyjson_api bool yyjson_impl_sr_arr_next(yyjson_sr *sr);
+yyjson_api bool yyjson_impl_sr_obj_findn(yyjson_sr *sr, const char *key,
+                                         size_t key_len);
+yyjson_api yyjson_sv yyjson_impl_sr_read_str(yyjson_sr *sr);
+yyjson_api const char *yyjson_impl_sr_parse_num(const char *dat,
+                                                yyjson_val *val);
+yyjson_api bool yyjson_impl_sr_read_num(yyjson_sr *sr, yyjson_val *num,
+                                        uint8_t kind);
+yyjson_api bool yyjson_impl_sr_obj_read_num(yyjson_sr *sr, const char *key,
+                                            size_t key_len, yyjson_val *num,
+                                            uint8_t kind);
+yyjson_api bool yyjson_impl_sr_read_scalar(yyjson_sr *sr, yyjson_val *val);
+yyjson_api bool yyjson_impl_sr_read_bool(yyjson_sr *sr);
+yyjson_api bool yyjson_impl_sr_read_null(yyjson_sr *sr);
+yyjson_api bool yyjson_impl_sr_skip_value(yyjson_sr *sr);
+yyjson_api bool yyjson_impl_sr_skip_more(yyjson_sr *sr,
+                                         yyjson_sr_skip_state st);
+#if !YYJSON_DISABLE_UTF8_VALIDATION
+yyjson_api const uint8_t *yyjson_impl_sr_scan_str_utf8(const uint8_t *src);
+#endif
+
+#define yyjson_impl_sr_fail(_sr, _msg) do { \
+    yyjson_impl_sr_set_err((_sr), YYJSON_READ_ERROR_INVALID_PARAMETER, \
+                           (_msg)); \
+    return false; \
+} while (0)
+
+#define yyjson_impl_sr_fail_val(_sr, _msg, _val) do { \
+    yyjson_impl_sr_set_err((_sr), YYJSON_READ_ERROR_INVALID_PARAMETER, \
+                           (_msg)); \
+    return (_val); \
+} while (0)
+
+/* Types for `sr_char_table`, low 3 bits store `yyjson_type`. */
+#define YYJSON_SR_CHAR_SPACE     (1 << 3) /* whitespace: [ \t\n\r] */
+#define YYJSON_SR_CHAR_DELIM     (1 << 4) /* delimiter: [ \t\n\r,]}]+ NUL */
+#define YYJSON_SR_CHAR_STRUCT    (1 << 5) /* structure stop: ["[]{}] + NUL */
+#define YYJSON_SR_CHAR_STR_RELAX (1 << 6) /* relaxed string stop: ["\] + NUL */
+#define YYJSON_SR_CHAR_STR       (1 << 7) /* string stop: ["\], ctrl, NUL */
+
+static const uint8_t yyjson_sr_char_table[256] = {
+    0xF0, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
+    0x80, 0x98, 0x98, 0x80, 0x80, 0x98, 0x80, 0x80,
+    0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
+    0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
+    0x18, 0x00, 0xE5, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x10, 0x04, 0x00, 0x00,
+    0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04,
+    0x04, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x26, 0xC0, 0x30, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x27, 0x00, 0x30, 0x00, 0x00
+};
+
+#define yyjson_sr_char_is(_c, _class) \
+    (yyjson_sr_char_table[(uint8_t)(_c)] & YYJSON_SR_CHAR_##_class)
+
+#define yyjson_sr_repeat16_incr(x) \
+    { x(0)  x(1)  x(2)  x(3)  x(4)  x(5)  x(6)  x(7)  \
+      x(8)  x(9)  x(10) x(11) x(12) x(13) x(14) x(15) }
+
+yyjson_api_inline const uint8_t *yyjson_impl_sr_skip_class(
+    const uint8_t *cur, uint8_t mask, bool expect) {
+    while (true) {
+#define yyjson_expr_jump(i) \
+        if (yyjson_likely(!!(yyjson_sr_char_table[cur[i]] & mask) == expect)) \
+        {} else goto skip_class_stop##i;
+#define yyjson_expr_stop(i) \
+        skip_class_stop##i: \
+        return cur + i;
+        yyjson_sr_repeat16_incr(yyjson_expr_jump)
+        cur += 16;
+        continue;
+        yyjson_sr_repeat16_incr(yyjson_expr_stop)
+#undef yyjson_expr_jump
+#undef yyjson_expr_stop
+    }
+}
+
+/** Skip whitespace. */
+yyjson_api_inline const uint8_t *yyjson_impl_sr_skip_space(
+    const uint8_t *cur) {
+    if (yyjson_likely(!yyjson_sr_char_is(*cur, SPACE))) return cur;
+    cur++;
+    while (yyjson_impl_word_load(cur) == YYJSON_WORD_REP(' ')) {
+        cur += sizeof(size_t);
+    }
+    return yyjson_impl_sr_skip_class(cur, YYJSON_SR_CHAR_SPACE, true);
+}
+
+/** Skip string bytes until [`"`, `\`, ctrl, NUL]. */
+yyjson_api_inline const uint8_t *yyjson_impl_sr_skip_str(const uint8_t *cur) {
+    while (true) {
+        size_t w = yyjson_impl_word_load(cur);
+        if (yyjson_impl_word_has_esc(w)) break;
+        cur += sizeof(size_t);
+    }
+    while (!yyjson_sr_char_is(*cur, STR)) cur++;
+    return cur;
+}
+
+/** Skip relaxed string bytes until  [`"`, `\`, NUL]. */
+yyjson_api_inline const uint8_t *yyjson_impl_sr_skip_str_relaxed(
+    const uint8_t *cur) {
+    while (true) {
+        size_t w = yyjson_impl_word_load(cur);
+        if (yyjson_impl_word_has_esc(w)) break;
+        cur += sizeof(size_t);
+    }
+    while (!yyjson_sr_char_is(*cur, STR_RELAX)) cur++;
+    return cur;
+}
+
+/** Skip one relaxed value inside the current window.
+    `cur` must point at a non-delimiter byte.
+    Returns true with `*next` past the value;
+    returns false if the value crosses `end`,
+    with `*st` set for `yyjson_impl_sr_skip_more()`. */
+yyjson_api_inline bool yyjson_impl_sr_skip_window(
+    const uint8_t *cur, const uint8_t *end, const uint8_t **next,
+    yyjson_sr_skip_state *st) {
+    size_t nest;
+    if (*cur == '"') {
+        cur++;
+        while (true) {
+            cur = yyjson_impl_sr_skip_str_relaxed(cur);
+            if (cur >= end) {
+                st->depth = 0;
+                st->mode = YYJSON_SR_SKIP_STR;
+                return false;
+            }
+            if (*cur++ == '"') {
+                *next = cur;
+                return true;
+            }
+            if (cur >= end) {
+                st->depth = 0;
+                st->mode = YYJSON_SR_SKIP_ESC;
+                return false;
+            }
+            cur++; /* escaped char */
+        }
+    }
+    if (*cur != '[' && *cur != '{') {
+        cur = yyjson_impl_sr_skip_class(cur, YYJSON_SR_CHAR_DELIM, false);
+        if (cur >= end) {
+            st->depth = 0;
+            st->mode = YYJSON_SR_SKIP_RAW;
+            return false;
+        }
+        *next = cur;
+        return true;
+    }
+    nest = 1;
+    cur++;
+    while (cur < end) {
+        /* scan to next quote or bracket; `{`/`}` fold onto `[`/`]` */
+        cur = yyjson_impl_sr_skip_class(cur, YYJSON_SR_CHAR_STRUCT, false);
+        if (cur >= end) break;
+        if (*cur == '"') {
+            cur++;
+            while (true) {
+                cur = yyjson_impl_sr_skip_str_relaxed(cur);
+                if (cur >= end) {
+                    st->depth = nest;
+                    st->mode = YYJSON_SR_SKIP_STR;
+                    return false;
+                }
+                if (*cur++ == '"') break;
+                if (cur >= end) {
+                    st->depth = nest;
+                    st->mode = YYJSON_SR_SKIP_ESC;
+                    return false;
+                }
+                cur++;
+            }
+        } else if (*cur == '[' || *cur == '{') {
+            nest++;
+            cur++;
+        } else {
+            cur++;
+            if (--nest == 0) {
+                *next = cur;
+                return true;
+            }
+        }
+    }
+    st->depth = nest;
+    st->mode = YYJSON_SR_SKIP_CTN;
+    return false;
+}
+
+/*==============================================================================
+ * MARK: - Streaming Reader API (Implementation)
+ *============================================================================*/
+
+yyjson_api_inline bool yyjson_sr_ok(const yyjson_sr *sr) {
+    return sr && !sr->fail;
+}
+
+yyjson_api_inline yyjson_read_code yyjson_sr_get_err(
+    const yyjson_sr *sr, yyjson_read_err *err) {
+    if (yyjson_likely(sr)) {
+        if (err) *err = sr->err;
+        return sr->fail ? sr->err.code : YYJSON_READ_SUCCESS;
+    }
+    if (err) {
+        err->code = YYJSON_READ_ERROR_INVALID_PARAMETER;
+        err->msg = "reader is NULL";
+        err->pos = 0;
+    }
+    return YYJSON_READ_ERROR_INVALID_PARAMETER;
+}
+
+yyjson_api_inline uint64_t yyjson_sr_pos(const yyjson_sr *sr) {
+    return sr && sr->win && sr->cur ?
+           sr->ofs + (uint64_t)(sr->cur - sr->win) : 0;
+}
+
+yyjson_api_inline yyjson_type yyjson_sr_peek_type(yyjson_sr *sr) {
+    const uint8_t *cur;
+    if (yyjson_unlikely(!sr || sr->fail)) return YYJSON_TYPE_NONE;
+    cur = yyjson_impl_sr_skip_space(sr->cur);
+    if (yyjson_likely(cur < sr->end)) {
+        sr->cur = cur;
+        return (yyjson_type)(yyjson_sr_char_table[*cur] & YYJSON_TYPE_MASK);
+    }
+    sr->cur = cur;
+    return yyjson_impl_sr_peek_type(sr);
+}
+
+/** Enters a container. `open` must be `[` or `{`. */
+yyjson_api_inline bool yyjson_impl_sr_ctn_begin(yyjson_sr *sr, uint8_t open) {
+    const uint8_t *cur;
+    if (yyjson_unlikely(!sr)) return false;
+    cur = yyjson_impl_sr_skip_space(sr->cur);
+    if (yyjson_likely(!sr->fail && *cur == open && sr->depth < sr->max_depth)) {
+        sr->cur = cur + 1;
+        sr->stk--;
+        *sr->stk = (uint8_t)(open + 2); /* `[` -> `]`, `{` -> `}` */
+        sr->depth++;
+        sr->st = YYJSON_SR_ST_NONE;
+        return true;
+    }
+    sr->cur = cur;
+    return yyjson_impl_sr_ctn_begin_slow(sr, open);
+}
+
+/** Leaves a container. `close` must be `]` or `}`. */
+yyjson_api_inline bool yyjson_impl_sr_ctn_end(yyjson_sr *sr, uint8_t close) {
+    const uint8_t *cur;
+    if (yyjson_unlikely(!sr)) return false;
+    cur = yyjson_impl_sr_skip_space(sr->cur);
+    if (yyjson_likely(!sr->fail && *cur == close && sr->depth &&
+                      *sr->stk == close)) {
+        sr->cur = cur + 1;
+        sr->stk++;
+        sr->depth--;
+        sr->st = YYJSON_SR_ST_DONE;
+        return true;
+    }
+    sr->cur = cur;
+    return yyjson_impl_sr_ctn_end_slow(sr, close);
+}
+
+yyjson_api_inline bool yyjson_sr_arr_begin(yyjson_sr *sr) {
+    return yyjson_impl_sr_ctn_begin(sr, '[');
+}
+
+yyjson_api_inline bool yyjson_sr_arr_next(yyjson_sr *sr) {
+    const uint8_t *cur;
+    uint8_t c;
+    if (yyjson_unlikely(!sr)) return false;
+    if (yyjson_unlikely(sr->fail || !sr->depth || *sr->stk != ']')) goto slow;
+    cur = yyjson_impl_sr_skip_space(sr->cur);
+    c = *cur;
+    if (yyjson_likely(c == ',')) {
+        if (yyjson_unlikely(sr->st != YYJSON_SR_ST_DONE)) goto slow;
+        cur = yyjson_impl_sr_skip_space(cur + 1);
+        c = *cur;
+        if (yyjson_unlikely(c == ']' || c == 0)) goto slow;
+        sr->cur = cur;
+        sr->st = YYJSON_SR_ST_HELD;
+        return true;
+    }
+    if (yyjson_likely(c == ']')) {
+        if (yyjson_unlikely(!sr->depth)) goto slow;
+        sr->cur = cur;
+        return false;
+    }
+    if (yyjson_likely(sr->st == YYJSON_SR_ST_NONE && c != 0 && c != '}')) {
+        sr->cur = cur; /* first element */
+        sr->st = YYJSON_SR_ST_HELD;
+        return true;
+    }
+
+slow:
+    return yyjson_impl_sr_arr_next(sr);
+}
+
+yyjson_api_inline bool yyjson_sr_arr_end(yyjson_sr *sr) {
+    return yyjson_impl_sr_ctn_end(sr, ']');
+}
+
+yyjson_api_inline bool yyjson_sr_obj_begin(yyjson_sr *sr) {
+    return yyjson_impl_sr_ctn_begin(sr, '{');
+}
+
+/** Returns whether a raw key match needs decoding or validation. */
+yyjson_api_inline bool yyjson_impl_sr_key_needs_check(const char *key,
+                                                      size_t key_len) {
+    while (key_len >= sizeof(size_t)) {
+        size_t w = yyjson_impl_word_load(key);
+        size_t bad = yyjson_impl_word_has_byte(w, '"') |
+                     yyjson_impl_word_has_byte(w, '\\') |
+                     yyjson_impl_word_has_ctrl(w);
+#if !YYJSON_DISABLE_UTF8_VALIDATION
+        bad |= w & YYJSON_WORD_80;
+#endif
+        if (yyjson_unlikely(bad)) return true;
+        key += sizeof(size_t);
+        key_len -= sizeof(size_t);
+    }
+    while (key_len--) {
+        uint8_t c = (uint8_t)*key++;
+        bool bad = c == '"' || c == '\\' || c < 0x20;
+#if !YYJSON_DISABLE_UTF8_VALIDATION
+        bad |= c >= 0x80;
+#endif
+        if (yyjson_unlikely(bad)) return true;
+    }
+    return false;
+}
+
+/** Compare a short key without a variable-length libc call. */
+yyjson_api_inline bool yyjson_impl_sr_key_eq(const uint8_t *src,
+                                             const char *key, size_t len) {
+    if (len <= sizeof(size_t)) {
+        size_t a = 0, b = 0;
+        memcpy(&a, src, len);
+        memcpy(&b, key, len);
+        return a == b;
+    }
+    return memcmp(src, key, len) == 0;
+}
+
+yyjson_api_inline bool yyjson_sr_obj_find(yyjson_sr *sr, const char *key) {
+    return yyjson_sr_obj_findn(sr, key, key ? strlen(key) : 0);
+}
+
+yyjson_api_inline bool yyjson_sr_obj_findn(yyjson_sr *sr, const char *key,
+                                           size_t key_len) {
+    const uint8_t *cur, *end;
+    bool need_comma;
+    if (yyjson_unlikely(!sr)) return false;
+    if (yyjson_unlikely(!key)) yyjson_impl_sr_fail(sr, "object key is NULL");
+    if (yyjson_unlikely(sr->fail || sr->st == YYJSON_SR_ST_HELD ||
+                        !sr->depth || *sr->stk != '}')) goto slow;
+    cur = sr->cur;
+    end = sr->end;
+    need_comma = (sr->st == YYJSON_SR_ST_DONE);
+
+    /* scan whole members in the current window  */
+    while (true) {
+        const uint8_t *ks, *p;
+        bool matched;
+        cur = yyjson_impl_sr_skip_space(cur);
+        if (yyjson_unlikely(cur >= end)) goto slow;
+        if (yyjson_unlikely(*cur == '}')) {
+            if (yyjson_unlikely(!sr->depth)) goto slow;
+            sr->cur = cur;
+            return false; /* not found; close remains for obj_end */
+        }
+        if (yyjson_likely(need_comma)) {
+            if (yyjson_unlikely(*cur != ',')) goto slow;
+            cur = yyjson_impl_sr_skip_space(cur + 1);
+            if (yyjson_unlikely(cur >= end || *cur == '}')) goto slow;
+        }
+        if (yyjson_unlikely(*cur != '"')) goto slow;
+        ks = cur + 1;
+        matched = (size_t)(end - ks) > key_len && ks[key_len] == '"' &&
+                  yyjson_impl_sr_key_eq(ks, key, key_len);
+        if (yyjson_likely(matched)) {
+            if (yyjson_unlikely(yyjson_impl_sr_key_needs_check(key, key_len))) {
+                goto slow;
+            }
+            p = ks + key_len + 1;
+        } else {
+            p = yyjson_impl_sr_skip_str_relaxed(ks);
+            if (yyjson_unlikely(p >= end || *p == '\\')) goto slow;
+            p++;
+        }
+        if (yyjson_likely(*p == ':')) {
+            p++;
+        } else {
+            p = yyjson_impl_sr_skip_space(p);
+            if (yyjson_unlikely(p >= end || *p != ':')) goto slow;
+            p++;
+        }
+        if (yyjson_likely(*p == ' ')) {
+            p++;
+            if (yyjson_unlikely(*p == ' ')) {
+                p = yyjson_impl_sr_skip_space(p);
+            }
+        } else {
+            p = yyjson_impl_sr_skip_space(p);
+        }
+        if (yyjson_unlikely(p >= end)) goto slow;
+        if (yyjson_likely(matched)) {
+            sr->cur = p;
+            sr->st = YYJSON_SR_ST_HELD;
+            return true;
+        } else {
+            yyjson_sr_skip_state st;
+            if (yyjson_unlikely(!yyjson_impl_sr_skip_window(p, end, &cur, &st)))
+            {
+                /* value crosses window:
+                   finish via continuation, then resume the fast scan */
+                sr->cur = end;
+                if (!yyjson_impl_sr_skip_more(sr, st)) return false;
+                sr->st = YYJSON_SR_ST_DONE;
+                cur = sr->cur;
+                end = sr->end;
+                need_comma = true;
+                continue;
+            }
+        }
+        need_comma = true;
+        sr->cur = cur; /* commit the completed member */
+        sr->st = YYJSON_SR_ST_DONE;
+    }
+
+slow:
+    return yyjson_impl_sr_obj_findn(sr, key, key_len);
+}
+
+yyjson_api_inline bool yyjson_sr_obj_end(yyjson_sr *sr) {
+    return yyjson_impl_sr_ctn_end(sr, '}');
+}
+
+yyjson_api_inline yyjson_sv yyjson_sr_read_str(yyjson_sr *sr) {
+    yyjson_sv empty = { NULL, 0 };
+    const uint8_t *start, *end, *cur;
+    if (yyjson_unlikely(!sr)) return empty;
+    start = sr->cur;
+    end = sr->end;
+    if (yyjson_unlikely(sr->fail || *start != '"')) goto slow;
+
+    cur = start + 1;
+    while ((size_t)(end - cur) >= sizeof(size_t)) {
+        size_t w = yyjson_impl_word_load(cur);
+        if (yyjson_impl_word_has_esc(w)) break;
+#if !YYJSON_DISABLE_UTF8_VALIDATION
+        if (yyjson_unlikely(w & YYJSON_WORD_80)) {
+            cur = yyjson_impl_sr_scan_str_utf8(cur);
+            if (yyjson_unlikely(!cur)) goto slow;
+            break;
+        }
+#endif
+        cur += sizeof(size_t);
+    }
+    /* NUL padding is < 0x20, so this stops without an end check. */
+    while (!yyjson_sr_char_is(*cur, STR)) {
+#if !YYJSON_DISABLE_UTF8_VALIDATION
+        if (yyjson_unlikely(*cur & 0x80)) {
+            cur = yyjson_impl_sr_scan_str_utf8(cur);
+            if (yyjson_unlikely(!cur)) goto slow;
+            break;
+        }
+#endif
+        cur++;
+    }
+    if (yyjson_unlikely(cur >= end || *cur != '"')) goto slow;
+    {
+        yyjson_sv sv;
+        *yyjson_constcast(uint8_t *)cur = '\0';
+        sv.ptr = (const char *)(start + 1);
+        sv.len = (size_t)(cur - start - 1);
+        sr->cur = cur + 1;
+        sr->st = YYJSON_SR_ST_DONE;
+        return sv;
+    }
+
+slow:
+    return yyjson_impl_sr_read_str(sr);
+}
+
+yyjson_api_inline uint64_t yyjson_sr_read_uint(yyjson_sr *sr) {
+    yyjson_val v;
+    const char *ret = NULL;
+    if (yyjson_unlikely(!sr)) return 0;
+    if (yyjson_likely(!sr->fail &&
+                      (ret = yyjson_impl_sr_parse_num(
+                          (const char *)sr->cur, &v)) &&
+                      (const uint8_t *)ret < sr->end &&
+                      yyjson_sr_char_is(*(const uint8_t *)ret, DELIM) &&
+                      yyjson_is_uint(&v))) {
+        sr->cur = (const uint8_t *)ret;
+        sr->st = YYJSON_SR_ST_DONE;
+        return yyjson_get_uint(&v);
+    }
+    if (!yyjson_impl_sr_read_num(sr, &v, YYJSON_SR_NUM_UINT)) return 0;
+    return yyjson_get_uint(&v);
+}
+
+yyjson_api_inline int64_t yyjson_sr_read_sint(yyjson_sr *sr) {
+    yyjson_val v;
+    const char *ret = NULL;
+    if (yyjson_unlikely(!sr)) return 0;
+    if (yyjson_likely(!sr->fail &&
+                      (ret = yyjson_impl_sr_parse_num(
+                          (const char *)sr->cur, &v)) &&
+                      (const uint8_t *)ret < sr->end &&
+                      yyjson_sr_char_is(*(const uint8_t *)ret, DELIM))) {
+        if (yyjson_likely(yyjson_is_sint(&v) ||
+                          (yyjson_is_uint(&v) &&
+                           !(yyjson_get_uint(&v) >> 63)))) {
+            sr->cur = (const uint8_t *)ret;
+            sr->st = YYJSON_SR_ST_DONE;
+            return yyjson_get_sint(&v);
+        }
+    }
+    if (!yyjson_impl_sr_read_num(sr, &v, YYJSON_SR_NUM_SINT)) return 0;
+    return yyjson_get_sint(&v);
+}
+
+yyjson_api_inline double yyjson_sr_read_real(yyjson_sr *sr) {
+    yyjson_val v;
+    const char *ret = NULL;
+    if (yyjson_unlikely(!sr)) return 0.0;
+    if (yyjson_likely(!sr->fail &&
+                      (ret = yyjson_impl_sr_parse_num(
+                          (const char *)sr->cur, &v)) &&
+                      (const uint8_t *)ret < sr->end &&
+                      yyjson_sr_char_is(*(const uint8_t *)ret, DELIM) &&
+                      yyjson_is_num(&v))) {
+        sr->cur = (const uint8_t *)ret;
+        sr->st = YYJSON_SR_ST_DONE;
+        return yyjson_get_num(&v);
+    }
+    if (!yyjson_impl_sr_read_num(sr, &v, YYJSON_SR_NUM_REAL)) return 0.0;
+    return yyjson_get_num(&v);
+}
+
+yyjson_api_inline bool yyjson_sr_read_bool(yyjson_sr *sr) {
+    const uint8_t *cur;
+    size_t len;
+    if (yyjson_unlikely(!sr)) return false;
+    cur = sr->cur;
+    len = (size_t)(sr->end - cur);
+    if (yyjson_likely(!sr->fail && len >= 5 &&
+                      memcmp(cur, "true", 4) == 0 &&
+                      yyjson_sr_char_is(cur[4], DELIM))) {
+        sr->cur = cur + 4;
+        sr->st = YYJSON_SR_ST_DONE;
+        return true;
+    }
+    if (yyjson_likely(!sr->fail && len >= 6 &&
+                      memcmp(cur, "false", 5) == 0 &&
+                      yyjson_sr_char_is(cur[5], DELIM))) {
+        sr->cur = cur + 5;
+        sr->st = YYJSON_SR_ST_DONE;
+        return false;
+    }
+    return yyjson_impl_sr_read_bool(sr);
+}
+
+yyjson_api_inline void yyjson_sr_read_null(yyjson_sr *sr) {
+    const uint8_t *cur;
+    if (yyjson_unlikely(!sr)) return;
+    cur = sr->cur;
+    if (yyjson_likely(!sr->fail &&
+                      (size_t)(sr->end - cur) >= 5 &&
+                      memcmp(cur, "null", 4) == 0 &&
+                      yyjson_sr_char_is(cur[4], DELIM))) {
+        sr->cur = cur + 4;
+        sr->st = YYJSON_SR_ST_DONE;
+        return;
+    }
+    (void)yyjson_impl_sr_read_null(sr);
+}
+
+yyjson_api_inline yyjson_val yyjson_sr_read_num(yyjson_sr *sr) {
+    yyjson_val num = { 0, { 0 } };
+    const char *ret = NULL;
+    if (yyjson_unlikely(!sr)) return num;
+    if (yyjson_likely(
+            !sr->fail &&
+            !(sr->flg & (YYJSON_READ_NUMBER_AS_RAW |
+                         YYJSON_READ_BIGNUM_AS_RAW)) &&
+            (ret = yyjson_impl_sr_parse_num(
+                (const char *)sr->cur, &num)) &&
+            (const uint8_t *)ret < sr->end &&
+            yyjson_sr_char_is(*(const uint8_t *)ret, DELIM))) {
+        sr->cur = (const uint8_t *)ret;
+        sr->st = YYJSON_SR_ST_DONE;
+        return num;
+    }
+    if (!yyjson_impl_sr_read_num(sr, &num, YYJSON_SR_NUM_ANY)) {
+        num.tag = 0;
+        num.uni.u64 = 0;
+    }
+    return num;
+}
+
+yyjson_api_inline yyjson_val yyjson_sr_read_scalar(yyjson_sr *sr) {
+    yyjson_val val = { 0, { 0 } };
+    if (yyjson_unlikely(!sr)) return val;
+    if (!yyjson_impl_sr_read_scalar(sr, &val)) {
+        val.tag = 0;
+        val.uni.u64 = 0;
+    }
+    return val;
+}
+
+yyjson_api_inline bool yyjson_sr_skip_value(yyjson_sr *sr) {
+    const uint8_t *next, *cur;
+    yyjson_sr_skip_state st;
+    if (yyjson_unlikely(!sr)) return false;
+    cur = yyjson_impl_sr_skip_space(sr->cur);
+    if (yyjson_unlikely(sr->fail || cur >= sr->end ||
+                        yyjson_sr_char_is(*cur, DELIM))) {
+        sr->cur = cur;
+        return yyjson_impl_sr_skip_value(sr);
+    }
+    if (yyjson_unlikely(*cur == '[' || *cur == '{')) {
+        sr->cur = cur;
+        return yyjson_impl_sr_skip_value(sr);
+    }
+    if (yyjson_likely(yyjson_impl_sr_skip_window(
+            cur, sr->end, &next, &st))) {
+        sr->cur = next;
+        sr->st = YYJSON_SR_ST_DONE;
+        return true;
+    }
+    sr->cur = sr->end;
+    if (!yyjson_impl_sr_skip_more(sr, st)) return false;
+    sr->st = YYJSON_SR_ST_DONE;
+    return true;
+}
+
+/** Ordered key + number fast path.
+    Returns the end of the number without committing,
+    so the typed wrapper can validate before updating the reader. */
+yyjson_api_inline const uint8_t *yyjson_impl_sr_obj_num_fast(
+    yyjson_sr *sr, const char *key, size_t key_len, yyjson_val *num) {
+    const uint8_t *cur, *end;
+    const char *ret;
+    if (yyjson_unlikely(!sr->depth || *sr->stk != '}' ||
+                        sr->st == YYJSON_SR_ST_HELD)) return NULL;
+    cur = yyjson_impl_sr_skip_space(sr->cur);
+    end = sr->end;
+    if (yyjson_likely(sr->st == YYJSON_SR_ST_DONE)) {
+        if (yyjson_unlikely(cur >= end || *cur != ',')) return NULL;
+        cur = yyjson_impl_sr_skip_space(cur + 1);
+    }
+    if (yyjson_unlikely(cur >= end || *cur != '"' ||
+                        (size_t)(end - cur) <= key_len + 1 ||
+                        cur[key_len + 1] != '"' ||
+                        !yyjson_impl_sr_key_eq(cur + 1, key, key_len) ||
+                        yyjson_impl_sr_key_needs_check(key, key_len))) {
+        return NULL;
+    }
+    cur = yyjson_impl_sr_skip_space(cur + key_len + 2);
+    if (yyjson_unlikely(cur >= end || *cur != ':')) return NULL;
+    cur = yyjson_impl_sr_skip_space(cur + 1);
+    if (yyjson_unlikely(cur >= end)) return NULL;
+    ret = yyjson_impl_sr_parse_num((const char *)cur, num);
+    if (yyjson_unlikely(!ret || (const uint8_t *)ret >= end ||
+                        !yyjson_sr_char_is(*(const uint8_t *)ret, DELIM))) {
+        return NULL;
+    }
+    return (const uint8_t *)ret;
+}
+
+yyjson_api_inline bool yyjson_impl_sr_obj_find_req(
+    yyjson_sr *sr, const char *key, size_t key_len) {
+    if (yyjson_likely(yyjson_sr_obj_findn(sr, key, key_len))) return true;
+    if (!sr->fail) {
+        yyjson_impl_sr_set_err(sr, YYJSON_READ_ERROR_UNEXPECTED_CONTENT,
+            "required object member was not found");
+    }
+    return false;
+}
+
+yyjson_api_inline double yyjson_sr_obj_read_real(yyjson_sr *sr,
+                                                 const char *key) {
+    yyjson_val num;
+    const uint8_t *after = NULL;
+    size_t key_len;
+    if (yyjson_unlikely(!sr)) return 0.0;
+    if (yyjson_unlikely(!key)) {
+        yyjson_impl_sr_fail_val(sr, "object key is NULL", 0.0);
+    }
+    key_len = strlen(key);
+    if (yyjson_likely(!sr->fail &&
+                      (after = yyjson_impl_sr_obj_num_fast(
+                          sr, key, key_len, &num)))) {
+        sr->cur = after;
+        sr->st = YYJSON_SR_ST_DONE;
+        return yyjson_get_num(&num);
+    }
+    if (!yyjson_impl_sr_obj_read_num(sr, key, key_len, &num,
+                                     YYJSON_SR_NUM_REAL)) return 0.0;
+    return yyjson_get_num(&num);
+}
+
+yyjson_api_inline uint64_t yyjson_sr_obj_read_uint(yyjson_sr *sr,
+                                                   const char *key) {
+    yyjson_val num;
+    const uint8_t *after = NULL;
+    size_t key_len;
+    if (yyjson_unlikely(!sr)) return 0;
+    if (yyjson_unlikely(!key)) {
+        yyjson_impl_sr_fail_val(sr, "object key is NULL", 0);
+    }
+    key_len = strlen(key);
+    if (yyjson_likely(!sr->fail &&
+                      (after = yyjson_impl_sr_obj_num_fast(
+                          sr, key, key_len, &num)) &&
+                      yyjson_is_uint(&num))) {
+        sr->cur = after;
+        sr->st = YYJSON_SR_ST_DONE;
+        return yyjson_get_uint(&num);
+    }
+    if (!yyjson_impl_sr_obj_read_num(sr, key, key_len, &num,
+                                     YYJSON_SR_NUM_UINT)) return 0;
+    return yyjson_get_uint(&num);
+}
+
+yyjson_api_inline int64_t yyjson_sr_obj_read_sint(yyjson_sr *sr,
+                                                  const char *key) {
+    yyjson_val num;
+    const uint8_t *after = NULL;
+    size_t key_len;
+    if (yyjson_unlikely(!sr)) return 0;
+    if (yyjson_unlikely(!key)) {
+        yyjson_impl_sr_fail_val(sr, "object key is NULL", 0);
+    }
+    key_len = strlen(key);
+    if (yyjson_likely(!sr->fail &&
+                      (after = yyjson_impl_sr_obj_num_fast(
+                          sr, key, key_len, &num)) &&
+                      (yyjson_is_sint(&num) ||
+                       (yyjson_is_uint(&num) &&
+                        !(yyjson_get_uint(&num) >> 63))))) {
+        sr->cur = after;
+        sr->st = YYJSON_SR_ST_DONE;
+        return yyjson_get_sint(&num);
+    }
+    if (!yyjson_impl_sr_obj_read_num(sr, key, key_len, &num,
+                                     YYJSON_SR_NUM_SINT)) return 0;
+    return yyjson_get_sint(&num);
+}
+
+yyjson_api_inline yyjson_sv yyjson_sr_obj_read_str(yyjson_sr *sr,
+                                                   const char *key) {
+    yyjson_sv empty = { NULL, 0 };
+    if (yyjson_unlikely(!sr)) return empty;
+    if (yyjson_unlikely(!key)) {
+        yyjson_impl_sr_fail_val(sr, "object key is NULL", empty);
+    }
+    if (yyjson_impl_sr_obj_find_req(sr, key, strlen(key))) {
+        return yyjson_sr_read_str(sr);
+    }
+    return empty;
+}
+
+yyjson_api_inline bool yyjson_sr_obj_read_bool(yyjson_sr *sr,
+                                               const char *key) {
+    if (yyjson_unlikely(!sr)) return false;
+    if (yyjson_unlikely(!key)) {
+        yyjson_impl_sr_fail_val(sr, "object key is NULL", false);
+    }
+    if (yyjson_impl_sr_obj_find_req(sr, key, strlen(key))) {
+        return yyjson_sr_read_bool(sr);
+    }
+    return false;
+}
+
+yyjson_api_inline void yyjson_sr_obj_read_null(yyjson_sr *sr,
+                                               const char *key) {
+    if (yyjson_unlikely(!sr)) return;
+    if (yyjson_unlikely(!key)) {
+        yyjson_impl_sr_set_err(sr, YYJSON_READ_ERROR_INVALID_PARAMETER,
+            "object key is NULL");
+        return;
+    }
+    if (yyjson_impl_sr_obj_find_req(sr, key, strlen(key))) {
+        yyjson_sr_read_null(sr);
+    }
+}
+
+#undef yyjson_impl_sr_fail
+#undef yyjson_impl_sr_fail_val
+#endif /* YYJSON_DISABLE_READER */
+
+/*==============================================================================
+ * MARK: - Streaming Writer API (Implementation)
+ *============================================================================*/
+
+#if !YYJSON_DISABLE_WRITER
+
+/**
+ Streaming JSON writer.
+
+ Free output room is `(stk - cur)`.
+ Total buffer size is `(stk - out) + depth`.
+ `cur` is the write cursor.
+ `stk` grows backward one byte per open container.
+ `max_depth` is the effective nesting capacity.
+ */
+struct yyjson_sw {
+    uint8_t *out;          /**< output buffer base */
+    uint8_t *cur;          /**< write cursor (next output byte) */
+    uint8_t *stk;          /**< container stack top (grows backward) */
+
+    yyjson_sw_write_fn fn; /**< flush callback (NULL for memory mode) */
+    void *ctx;             /**< user context for `fn` */
+    uint64_t ofs;          /**< output bytes already sent to callback */
+    size_t depth;          /**< current open-container depth */
+    size_t max_depth;      /**< open-container depth capacity */
+    yyjson_write_flag flg; /**< options from init */
+    yyjson_write_err err;  /**< first error */
+
+    uint8_t st;            /**< innermost container state, `YYJSON_SW_ST_*` */
+    bool fail;             /**< sticky error flag */
+    bool root;             /**< one root value has been completed */
+    bool done;             /**< `yyjson_sw_finish()` succeeded */
+};
+
+#define YYJSON_SW_ST_OBJECT     0x01u
+#define YYJSON_SW_ST_HAS_VALUE  0x02u
+#define YYJSON_SW_ST_NEED_VALUE 0x04u
+#define YYJSON_SW_ST_PRETTY     0x08u
+
+yyjson_api bool yyjson_impl_sw_make_room(yyjson_sw *sw, size_t need);
+yyjson_api bool yyjson_impl_sw_fail(yyjson_sw *sw, yyjson_write_code code,
+                                    const char *msg);
+yyjson_api bool yyjson_impl_sw_pretty(yyjson_sw *sw, size_t depth, bool comma);
+yyjson_api bool yyjson_impl_sw_key(yyjson_sw *sw, const char *key, size_t len,
+                                   bool plain);
+yyjson_api bool yyjson_impl_sw_str(yyjson_sw *sw, const char *str, size_t len,
+                                   bool plain);
+
+yyjson_api_inline bool yyjson_impl_sw_reserve(yyjson_sw *sw, size_t need) {
+    return yyjson_likely((size_t)(sw->stk - sw->cur) >= need) ||
+           yyjson_impl_sw_make_room(sw, need);
+}
+
+yyjson_api_inline bool yyjson_impl_sw_before_value(yyjson_sw *sw) {
+    uint8_t st;
+    if (yyjson_unlikely(sw->done)) {
+        return yyjson_impl_sw_fail(sw, YYJSON_WRITE_ERROR_INVALID_PARAMETER,
+            "invalid streaming writer state");
+    }
+    if (sw->depth == 0) {
+        if (yyjson_unlikely(sw->root)) {
+            return yyjson_impl_sw_fail(sw, YYJSON_WRITE_ERROR_INVALID_PARAMETER,
+                "invalid streaming writer state");
+        }
+        return true;
+    }
+    st = sw->st;
+    if (st & YYJSON_SW_ST_OBJECT) {
+        if (yyjson_likely(st & YYJSON_SW_ST_NEED_VALUE)) return true;
+        return yyjson_impl_sw_fail(sw, YYJSON_WRITE_ERROR_INVALID_PARAMETER,
+            "invalid streaming writer state");
+    }
+    if (yyjson_unlikely(st & YYJSON_SW_ST_PRETTY)) {
+        return yyjson_impl_sw_pretty(sw, sw->depth,
+                                     (st & YYJSON_SW_ST_HAS_VALUE) != 0);
+    }
+    if (st & YYJSON_SW_ST_HAS_VALUE) {
+        if (!yyjson_impl_sw_reserve(sw, 1)) return false;
+        *sw->cur++ = ',';
+    }
+    return true;
+}
+
+yyjson_api_inline bool yyjson_impl_sw_after_value(yyjson_sw *sw) {
+    if (sw->depth == 0) {
+        sw->root = true;
+        return true;
+    }
+    sw->st = (uint8_t)((sw->st | YYJSON_SW_ST_HAS_VALUE) &
+                       (uint8_t)~YYJSON_SW_ST_NEED_VALUE);
+    return true;
+}
+
+yyjson_api_inline bool yyjson_impl_sw_ctn_begin(yyjson_sw *sw,
+                                                uint8_t open) {
+    if (yyjson_unlikely(sw->depth >= sw->max_depth)) {
+        return yyjson_impl_sw_fail(sw, YYJSON_WRITE_ERROR_DEPTH,
+            "streaming writer depth limit exceeded");
+    }
+    if (!yyjson_impl_sw_before_value(sw) ||
+        !yyjson_impl_sw_reserve(sw, 2)) {
+        return false;
+    }
+    *sw->cur++ = open;
+    sw->stk--;
+    *sw->stk = sw->st; /* save the enclosing container */
+    sw->st = (uint8_t)(
+        ((sw->flg & (YYJSON_WRITE_PRETTY | YYJSON_WRITE_PRETTY_TWO_SPACES)) ?
+        YYJSON_SW_ST_PRETTY : 0) |
+        (open == '[' ? 0 : YYJSON_SW_ST_OBJECT));
+    sw->depth++;
+    return true;
+}
+
+yyjson_api_inline bool yyjson_impl_sw_ctn_end(yyjson_sw *sw, uint8_t close) {
+    uint8_t st, obj = close == '}' ? YYJSON_SW_ST_OBJECT : 0;
+    if (yyjson_unlikely(sw->depth == 0)) {
+        return yyjson_impl_sw_fail(sw, YYJSON_WRITE_ERROR_INVALID_PARAMETER,
+            "invalid streaming writer state");
+    }
+    st = sw->st;
+    if (yyjson_unlikely((st & YYJSON_SW_ST_OBJECT) != obj ||
+                        (obj && (st & YYJSON_SW_ST_NEED_VALUE)))) {
+        return yyjson_impl_sw_fail(sw, YYJSON_WRITE_ERROR_INVALID_PARAMETER,
+            "invalid streaming writer state");
+    }
+    if (yyjson_unlikely((st & YYJSON_SW_ST_PRETTY) &&
+                        (st & YYJSON_SW_ST_HAS_VALUE)) &&
+        !yyjson_impl_sw_pretty(sw, sw->depth - 1, false)) return false;
+    sw->st = *sw->stk++; /* restore the enclosing container */
+    sw->depth--;
+    *sw->cur++ = close;
+    return yyjson_impl_sw_after_value(sw);
+}
+
+yyjson_api_inline bool yyjson_sw_ok(const yyjson_sw *sw) {
+    return sw && !sw->fail;
+}
+
+yyjson_api_inline yyjson_write_code yyjson_sw_get_err(
+    const yyjson_sw *sw, yyjson_write_err *err) {
+    if (yyjson_likely(sw)) {
+        if (err) *err = sw->err;
+        return sw->fail ? sw->err.code : YYJSON_WRITE_SUCCESS;
+    }
+    if (err) {
+        err->code = YYJSON_WRITE_ERROR_INVALID_PARAMETER;
+        err->msg = "writer is NULL";
+    }
+    return YYJSON_WRITE_ERROR_INVALID_PARAMETER;
+}
+
+yyjson_api_inline uint64_t yyjson_sw_len(const yyjson_sw *sw) {
+    return sw && sw->out ?
+           sw->ofs + (uint64_t)(sw->cur - sw->out) : 0;
+}
+
+yyjson_api_inline bool yyjson_sw_arr_begin(yyjson_sw *sw) {
+    if (yyjson_unlikely(!sw || sw->fail)) return false;
+    return yyjson_impl_sw_ctn_begin(sw, '[');
+}
+
+yyjson_api_inline bool yyjson_sw_arr_end(yyjson_sw *sw) {
+    if (yyjson_unlikely(!sw || sw->fail)) return false;
+    return yyjson_impl_sw_ctn_end(sw, ']');
+}
+
+yyjson_api_inline bool yyjson_sw_obj_begin(yyjson_sw *sw) {
+    if (yyjson_unlikely(!sw || sw->fail)) return false;
+    return yyjson_impl_sw_ctn_begin(sw, '{');
+}
+
+yyjson_api_inline bool yyjson_sw_obj_end(yyjson_sw *sw) {
+    if (yyjson_unlikely(!sw || sw->fail)) return false;
+    return yyjson_impl_sw_ctn_end(sw, '}');
+}
+
+yyjson_api_inline bool yyjson_impl_sw_is_plain(
+    const yyjson_sw *sw, const char *str, size_t len) {
+    const uint8_t *cur = (const uint8_t *)str;
+    const uint8_t *end = cur + len;
+    bool esc_slash = (sw->flg & YYJSON_WRITE_ESCAPE_SLASHES) != 0;
+    while ((size_t)(end - cur) >= sizeof(size_t)) {
+        size_t w = yyjson_impl_word_load(cur);
+        if (yyjson_impl_word_has_esc(w) | (w & YYJSON_WORD_80) |
+            (esc_slash && yyjson_impl_word_has_byte(w, '/'))) return false;
+        cur += sizeof(size_t);
+    }
+    while (cur < end) {
+        uint8_t c = *cur++;
+        if (c < 0x20 || c == '"' || c == '\\' || c >= 0x80 ||
+            (esc_slash && c == '/')) return false;
+    }
+    return true;
+}
+
+yyjson_api_inline bool yyjson_sw_write_keyn(yyjson_sw *sw, const char *key,
+                                            size_t len) {
+    uint8_t st;
+    uint8_t *dst;
+    size_t extra, need;
+    if (yyjson_unlikely(!sw || sw->fail)) return false;
+    if (yyjson_unlikely(!key)) {
+        return yyjson_impl_sw_fail(sw, YYJSON_WRITE_ERROR_INVALID_PARAMETER,
+            "object key pointer is NULL");
+    }
+    if (yyjson_unlikely(sw->done || sw->depth == 0)) {
+        return yyjson_impl_sw_fail(sw, YYJSON_WRITE_ERROR_INVALID_PARAMETER,
+            "invalid streaming writer state");
+    }
+    if (yyjson_unlikely(len > (~(size_t)0) - 4)) {
+        return yyjson_impl_sw_fail(sw, YYJSON_WRITE_ERROR_INVALID_PARAMETER,
+            "input length is too large");
+    }
+    st = sw->st;
+    if (yyjson_unlikely(!(st & YYJSON_SW_ST_OBJECT) ||
+                        (st & YYJSON_SW_ST_NEED_VALUE))) {
+        return yyjson_impl_sw_fail(sw, YYJSON_WRITE_ERROR_INVALID_PARAMETER,
+            "invalid streaming writer state");
+    }
+    if (yyjson_unlikely(st & YYJSON_SW_ST_PRETTY)) {
+        return yyjson_impl_sw_key(sw, key, len, false);
+    }
+    extra = (st & YYJSON_SW_ST_HAS_VALUE) ? 1 : 0;
+    need = len + 3 + extra;
+    if (yyjson_unlikely((size_t)(sw->stk - sw->cur) < need)) {
+        if (yyjson_unlikely(!yyjson_impl_sw_is_plain(sw, key, len))) {
+            return yyjson_impl_sw_key(sw, key, len, false);
+        }
+        return yyjson_impl_sw_key(sw, key, len, true);
+    }
+    if (yyjson_unlikely(!yyjson_impl_sw_is_plain(sw, key, len))) {
+        return yyjson_impl_sw_key(sw, key, len, false);
+    }
+
+    dst = sw->cur;
+    if (extra) *dst++ = ',';
+    *dst++ = '"';
+    memcpy(dst, key, len);
+    dst += len;
+    *dst++ = '"';
+    *dst++ = ':';
+    sw->cur = dst;
+    sw->st = (uint8_t)(st | YYJSON_SW_ST_NEED_VALUE);
+    return true;
+}
+
+yyjson_api_inline bool yyjson_sw_write_strn(yyjson_sw *sw, const char *str,
+                                            size_t len) {
+    uint8_t *dst;
+    if (yyjson_unlikely(!sw || sw->fail)) return false;
+    if (yyjson_unlikely(!str)) {
+        return yyjson_impl_sw_fail(sw, YYJSON_WRITE_ERROR_INVALID_PARAMETER,
+            "string pointer is NULL");
+    }
+    if (yyjson_unlikely(sw->done)) {
+        return yyjson_impl_sw_fail(sw, YYJSON_WRITE_ERROR_INVALID_PARAMETER,
+            "invalid streaming writer state");
+    }
+    if (yyjson_unlikely(len > (~(size_t)0) - 2)) {
+        return yyjson_impl_sw_fail(sw, YYJSON_WRITE_ERROR_INVALID_PARAMETER,
+            "input length is too large");
+    }
+    if (yyjson_unlikely(!yyjson_impl_sw_is_plain(sw, str, len))) {
+        return yyjson_impl_sw_str(sw, str, len, false);
+    }
+    if (yyjson_unlikely(len + 2 > (size_t)(sw->stk - sw->out))) {
+        return yyjson_impl_sw_str(sw, str, len, true);
+    }
+    if (!yyjson_impl_sw_before_value(sw)) return false;
+    if (!yyjson_impl_sw_reserve(sw, len + 2)) return false;
+
+    dst = sw->cur;
+    *dst++ = '"';
+    memcpy(dst, str, len);
+    dst += len;
+    *dst++ = '"';
+    sw->cur = dst;
+    return yyjson_impl_sw_after_value(sw);
+}
+
+yyjson_api_inline bool yyjson_impl_sw_lit(
+    yyjson_sw *sw, const char *lit, size_t len) {
+    uint8_t *dst;
+    if (!yyjson_impl_sw_before_value(sw)) return false;
+    if (yyjson_unlikely(!yyjson_impl_sw_reserve(sw, len))) return false;
+    dst = sw->cur;
+    memcpy(dst, lit, len);
+    sw->cur = dst + len;
+    return yyjson_impl_sw_after_value(sw);
+}
+
+yyjson_api_inline bool yyjson_sw_write_bool(yyjson_sw *sw, bool val) {
+    if (yyjson_unlikely(!sw || sw->fail)) return false;
+    return yyjson_impl_sw_lit(sw, val ? "true" : "false", val ? 4 : 5);
+}
+
+yyjson_api_inline bool yyjson_sw_write_null(yyjson_sw *sw) {
+    if (yyjson_unlikely(!sw || sw->fail)) return false;
+    return yyjson_impl_sw_lit(sw, "null", 4);
+}
+
+#endif /* !YYJSON_DISABLE_WRITER */
+
+#endif /* YYJSON_DISABLE_STREAMING */
 
 
 

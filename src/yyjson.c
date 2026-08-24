@@ -337,11 +337,7 @@ uint32_t yyjson_version(void) {
 /* The minimum size of the dynamic allocator's chunk. */
 #define YYJSON_ALC_DYN_MIN_SIZE             0x1000
 
-/* Default value for compile-time options. */
 
-#ifndef YYJSON_READER_DEPTH_LIMIT
-#define YYJSON_READER_DEPTH_LIMIT 0
-#endif
 
 /*==============================================================================
  * MARK: - Macros (Private)
@@ -373,12 +369,6 @@ uint32_t yyjson_version(void) {
 #define static_inline   static yyjson_inline
 #undef  static_noinline
 #define static_noinline static yyjson_noinline
-
-/* Macros for min and max. */
-#undef  yyjson_min
-#define yyjson_min(x, y) ((x) < (y) ? (x) : (y))
-#undef  yyjson_max
-#define yyjson_max(x, y) ((x) > (y) ? (x) : (y))
 
 /* Used to write u64 literal for C89 which doesn't support "ULL" suffix. */
 #undef  U64
@@ -1968,6 +1958,16 @@ static_inline bool f64_is_inf(f64 val) {
     return (f64_to_bits(val) & F64_EXP_MASK) == F64_BITS_INF;
 #else
     return val >= (f64)INFINITY || val <= (f64)-INFINITY;
+#endif
+}
+
+/** Returns whether the double value is NaN. */
+static_inline bool f64_is_nan(f64 val) {
+#if YYJSON_HAS_IEEE_754
+    u64 bits = f64_to_bits(val);
+    return (bits & F64_EXP_MASK) == F64_BITS_INF && (bits & F64_SIG_MASK);
+#else
+    return val != val;
 #endif
 }
 
@@ -5402,7 +5402,7 @@ static_inline yyjson_doc *read_root_minify(u8 *hdr, u8 *cur, u8 *eof,
     u8 **pre = &raw_ptr; /* previous raw end pointer */
 
 #if YYJSON_READER_DEPTH_LIMIT
-    u32 container_depth = 0; /* current array/object depth */
+    usize ctn_depth = 0; /* current array/object depth */
 #endif
 
     dat_len = has_flg(STOP_WHEN_DONE) ? 256 : (usize)(eof - cur);
@@ -5431,8 +5431,8 @@ static_inline yyjson_doc *read_root_minify(u8 *hdr, u8 *cur, u8 *eof,
 
 arr_begin:
 #if YYJSON_READER_DEPTH_LIMIT
-    container_depth++;
-    if (unlikely(container_depth >= YYJSON_READER_DEPTH_LIMIT)) {
+    ctn_depth++;
+    if (unlikely(ctn_depth >= (usize)YYJSON_READER_DEPTH_LIMIT)) {
         goto fail_depth;
     }
 #endif
@@ -5542,7 +5542,7 @@ arr_val_end:
 
 arr_end:
 #if YYJSON_READER_DEPTH_LIMIT
-    container_depth--;
+    ctn_depth--;
 #endif
     /* get parent container */
     ctn_parent = (yyjson_val *)(void *)((u8 *)ctn - ctn->uni.ofs);
@@ -5563,8 +5563,8 @@ arr_end:
 
 obj_begin:
 #if YYJSON_READER_DEPTH_LIMIT
-    container_depth++;
-    if (unlikely(container_depth >= YYJSON_READER_DEPTH_LIMIT)) {
+    ctn_depth++;
+    if (unlikely(ctn_depth >= (usize)YYJSON_READER_DEPTH_LIMIT)) {
         goto fail_depth;
     }
 #endif
@@ -5715,7 +5715,7 @@ obj_val_end:
 
 obj_end:
 #if YYJSON_READER_DEPTH_LIMIT
-    container_depth--;
+    ctn_depth--;
 #endif
     /* pop container */
     ctn_parent = (yyjson_val *)(void *)((u8 *)ctn - ctn->uni.ofs);
@@ -5828,7 +5828,7 @@ static_inline yyjson_doc *read_root_pretty(u8 *hdr, u8 *cur, u8 *eof,
     u8 *raw_ptr = raw_end;
     u8 **pre = &raw_ptr; /* previous raw end pointer */
 #if YYJSON_READER_DEPTH_LIMIT
-    u32 container_depth = 0; /* current array/object depth */
+    usize ctn_depth = 0; /* current array/object depth */
 #endif
 
     dat_len = has_flg(STOP_WHEN_DONE) ? 256 : (usize)(eof - cur);
@@ -5859,8 +5859,8 @@ static_inline yyjson_doc *read_root_pretty(u8 *hdr, u8 *cur, u8 *eof,
 
 arr_begin:
 #if YYJSON_READER_DEPTH_LIMIT
-    container_depth++;
-    if (unlikely(container_depth >= YYJSON_READER_DEPTH_LIMIT)) {
+    ctn_depth++;
+    if (unlikely(ctn_depth >= (usize)YYJSON_READER_DEPTH_LIMIT)) {
         goto fail_depth;
     }
 #endif
@@ -5988,7 +5988,7 @@ arr_val_end:
 
 arr_end:
 #if YYJSON_READER_DEPTH_LIMIT
-    container_depth--;
+    ctn_depth--;
 #endif
     /* get parent container */
     ctn_parent = (yyjson_val *)(void *)((u8 *)ctn - ctn->uni.ofs);
@@ -6010,8 +6010,8 @@ arr_end:
 
 obj_begin:
 #if YYJSON_READER_DEPTH_LIMIT
-    container_depth++;
-    if (unlikely(container_depth >= YYJSON_READER_DEPTH_LIMIT)) {
+    ctn_depth++;
+    if (unlikely(ctn_depth >= (usize)YYJSON_READER_DEPTH_LIMIT)) {
         goto fail_depth;
     }
 #endif
@@ -6183,7 +6183,7 @@ obj_val_end:
 
 obj_end:
 #if YYJSON_READER_DEPTH_LIMIT
-    container_depth--;
+    ctn_depth--;
 #endif
 
     /* pop container */
@@ -6270,7 +6270,7 @@ yyjson_doc *yyjson_read_opts(char *dat, usize len,
     if (unlikely(!dat)) return_err(0, INVALID_PARAMETER, "input data is NULL");
     if (unlikely(!len)) return_err(0, INVALID_PARAMETER, "input length is 0");
 
-    /* add 4-byte zero padding for input data if necessary */
+    /* add zero padding for input data if necessary */
     if (has_flg(INSITU)) {
         hdr = (u8 *)dat;
         eof = (u8 *)dat + len;
@@ -6287,7 +6287,8 @@ yyjson_doc *yyjson_read_opts(char *dat, usize len,
         cur = hdr;
         memcpy(hdr, dat, len);
     }
-    memset(eof, 0, YYJSON_PADDING_SIZE);
+    /* 4-byte padding is sufficient; keep 4 for old ABI compatibility. */
+    memset(eof, 0, 4);
 
     if (has_allow(BOM)) {
         if (len >= 3 && is_utf8_bom(cur)) cur += 3;
@@ -6592,7 +6593,7 @@ yyjson_incr_state *yyjson_incr_new(char *buf, size_t buf_len,
     state->flg = flg;
     state->buf_len = buf_len;
 
-    /* add 4-byte zero padding for input data if necessary */
+    /* add zero padding for input data if necessary */
     if (has_flg(INSITU)) {
         state->hdr = (u8 *)buf;
     } else {
@@ -6603,7 +6604,8 @@ yyjson_incr_state *yyjson_incr_new(char *buf, size_t buf_len,
         }
         memcpy(state->hdr, buf, buf_len);
     }
-    memset(state->hdr + buf_len, 0, YYJSON_PADDING_SIZE);
+    /* 4-byte padding is sufficient; keep 4 for old ABI compatibility. */
+    memset(state->hdr + buf_len, 0, 4);
     state->cur = state->hdr;
     state->raw_ptr = state->raw_end;
     state->label = LABEL_doc_begin;
@@ -6708,7 +6710,7 @@ yyjson_doc *yyjson_incr_read(yyjson_incr_state *state, size_t len,
     u8 saved_end = '\0'; /* saved end char */
 
 #if YYJSON_READER_DEPTH_LIMIT
-    u32 container_depth = 0; /* current array/object depth */
+    usize ctn_depth = 0; /* current array/object depth */
 #endif
 
     /* validate input parameters */
@@ -6838,8 +6840,8 @@ doc_begin:
 
 arr_begin:
 #if YYJSON_READER_DEPTH_LIMIT
-    container_depth++;
-    if (unlikely(container_depth >= YYJSON_READER_DEPTH_LIMIT)) {
+    ctn_depth++;
+    if (unlikely(ctn_depth >= (usize)YYJSON_READER_DEPTH_LIMIT)) {
         goto fail_depth;
     }
 #endif
@@ -6934,7 +6936,7 @@ arr_val_end:
 
 arr_end:
 #if YYJSON_READER_DEPTH_LIMIT
-    container_depth--;
+    ctn_depth--;
 #endif
     /* get parent container */
     ctn_parent = (yyjson_val *)(void *)((u8 *)ctn - ctn->uni.ofs);
@@ -6955,8 +6957,8 @@ arr_end:
 
 obj_begin:
 #if YYJSON_READER_DEPTH_LIMIT
-    container_depth++;
-    if (unlikely(container_depth >= YYJSON_READER_DEPTH_LIMIT)) {
+    ctn_depth++;
+    if (unlikely(ctn_depth >= (usize)YYJSON_READER_DEPTH_LIMIT)) {
         goto fail_depth;
     }
 #endif
@@ -7076,7 +7078,7 @@ obj_val_end:
 
 obj_end:
 #if YYJSON_READER_DEPTH_LIMIT
-    container_depth--;
+    ctn_depth--;
 #endif
 
     /* pop container */
@@ -9319,6 +9321,9 @@ static_inline u8 *write_root_minify(const yyjson_val *root,
     u8 *hdr, *cur, *end, *tmp;
     yyjson_write_ctx *ctx, *ctx_tmp;
     usize alc_len, alc_inc, ctx_len, ext_len, str_len;
+#if YYJSON_WRITER_DEPTH_LIMIT
+    usize ctn_depth = 0;
+#endif
     const u8 *str_ptr;
     const char_enc_type *enc_table = get_enc_table_with_flag(flg);
     const u8 *hex_table = get_hex_table_with_flag(flg);
@@ -9381,7 +9386,16 @@ val_begin:
         ctn_len_tmp = unsafe_yyjson_get_len(val);
         ctn_obj_tmp = (val_type == YYJSON_TYPE_OBJ);
         incr_len(2 * sizeof(*ctx));
+#if YYJSON_WRITER_DEPTH_LIMIT
+        ctn_depth++;
+        if (unlikely(ctn_depth >= (usize)YYJSON_WRITER_DEPTH_LIMIT)) {
+            goto fail_depth;
+        }
+#endif
         if (unlikely(ctn_len_tmp == 0)) {
+#if YYJSON_WRITER_DEPTH_LIMIT
+            ctn_depth--;
+#endif
             /* write empty container */
             *cur++ = (u8)('[' | ((u8)ctn_obj_tmp << 5));
             *cur++ = (u8)(']' | ((u8)ctn_obj_tmp << 5));
@@ -9427,6 +9441,9 @@ val_end:
     goto val_begin;
 
 ctn_end:
+#if YYJSON_WRITER_DEPTH_LIMIT
+    ctn_depth--;
+#endif
     cur--;
     *cur++ = (u8)(']' | ((u8)ctn_obj << 5));
     *cur++ = ',';
@@ -9454,6 +9471,9 @@ fail_alloc: return_err(MEMORY_ALLOCATION, MSG_MALLOC);
 fail_type:  return_err(INVALID_VALUE_TYPE, MSG_ERR_TYPE);
 fail_num:   return_err(NAN_OR_INF, MSG_NAN_INF);
 fail_str:   return_err(INVALID_STRING, MSG_ERR_UTF8);
+#if YYJSON_WRITER_DEPTH_LIMIT
+fail_depth: return_err(DEPTH, MSG_DEPTH);
+#endif
 
 #undef return_err
 #undef incr_len
@@ -9510,6 +9530,9 @@ static_inline u8 *write_root_pretty(const yyjson_val *root,
     u8 *hdr, *cur, *end, *tmp;
     yyjson_write_ctx *ctx, *ctx_tmp;
     usize alc_len, alc_inc, ctx_len, ext_len, str_len, level;
+#if YYJSON_WRITER_DEPTH_LIMIT
+    usize ctn_depth = 0;
+#endif
     const u8 *str_ptr;
     const char_enc_type *enc_table = get_enc_table_with_flag(flg);
     const u8 *hex_table = get_hex_table_with_flag(flg);
@@ -9584,7 +9607,16 @@ val_begin:
         ctn_len_tmp = unsafe_yyjson_get_len(val);
         ctn_obj_tmp = (val_type == YYJSON_TYPE_OBJ);
         incr_len(2 * sizeof(*ctx) + (no_indent ? 0 : level * 4));
+#if YYJSON_WRITER_DEPTH_LIMIT
+        ctn_depth++;
+        if (unlikely(ctn_depth >= (usize)YYJSON_WRITER_DEPTH_LIMIT)) {
+            goto fail_depth;
+        }
+#endif
         if (unlikely(ctn_len_tmp == 0)) {
+#if YYJSON_WRITER_DEPTH_LIMIT
+            ctn_depth--;
+#endif
             /* write empty container */
             cur = write_indent(cur, no_indent ? 0 : level, spaces);
             *cur++ = (u8)('[' | ((u8)ctn_obj_tmp << 5));
@@ -9642,6 +9674,9 @@ val_end:
     goto val_begin;
 
 ctn_end:
+#if YYJSON_WRITER_DEPTH_LIMIT
+    ctn_depth--;
+#endif
     cur -= 2;
     *cur++ = '\n';
     incr_len(level * 4);
@@ -9672,6 +9707,9 @@ fail_alloc: return_err(MEMORY_ALLOCATION, MSG_MALLOC);
 fail_type:  return_err(INVALID_VALUE_TYPE, MSG_ERR_TYPE);
 fail_num:   return_err(NAN_OR_INF, MSG_NAN_INF);
 fail_str:   return_err(INVALID_STRING, MSG_ERR_UTF8);
+#if YYJSON_WRITER_DEPTH_LIMIT
+fail_depth: return_err(DEPTH, MSG_DEPTH);
+#endif
 
 #undef return_err
 #undef incr_len
@@ -9928,6 +9966,9 @@ static_inline u8 *mut_write_root_minify(const yyjson_mut_val *root,
     u8 *hdr, *cur, *end, *tmp;
     yyjson_mut_write_ctx *ctx, *ctx_tmp;
     usize alc_len, alc_inc, ctx_len, ext_len, str_len;
+#if YYJSON_WRITER_DEPTH_LIMIT
+    usize ctn_depth = 0;
+#endif
     const u8 *str_ptr;
     const char_enc_type *enc_table = get_enc_table_with_flag(flg);
     const u8 *hex_table = get_hex_table_with_flag(flg);
@@ -9991,7 +10032,16 @@ val_begin:
         ctn_len_tmp = unsafe_yyjson_get_len(val);
         ctn_obj_tmp = (val_type == YYJSON_TYPE_OBJ);
         incr_len(2 * sizeof(*ctx));
+#if YYJSON_WRITER_DEPTH_LIMIT
+        ctn_depth++;
+        if (unlikely(ctn_depth >= (usize)YYJSON_WRITER_DEPTH_LIMIT)) {
+            goto fail_depth;
+        }
+#endif
         if (unlikely(ctn_len_tmp == 0)) {
+#if YYJSON_WRITER_DEPTH_LIMIT
+            ctn_depth--;
+#endif
             /* write empty container */
             *cur++ = (u8)('[' | ((u8)ctn_obj_tmp << 5));
             *cur++ = (u8)(']' | ((u8)ctn_obj_tmp << 5));
@@ -10039,6 +10089,9 @@ val_end:
     goto val_begin;
 
 ctn_end:
+#if YYJSON_WRITER_DEPTH_LIMIT
+    ctn_depth--;
+#endif
     cur--;
     *cur++ = (u8)(']' | ((u8)ctn_obj << 5));
     *cur++ = ',';
@@ -10068,6 +10121,9 @@ fail_alloc: return_err(MEMORY_ALLOCATION, MSG_MALLOC);
 fail_type:  return_err(INVALID_VALUE_TYPE, MSG_ERR_TYPE);
 fail_num:   return_err(NAN_OR_INF, MSG_NAN_INF);
 fail_str:   return_err(INVALID_STRING, MSG_ERR_UTF8);
+#if YYJSON_WRITER_DEPTH_LIMIT
+fail_depth: return_err(DEPTH, MSG_DEPTH);
+#endif
 
 #undef return_err
 #undef incr_len
@@ -10125,6 +10181,9 @@ static_inline u8 *mut_write_root_pretty(const yyjson_mut_val *root,
     u8 *hdr, *cur, *end, *tmp;
     yyjson_mut_write_ctx *ctx, *ctx_tmp;
     usize alc_len, alc_inc, ctx_len, ext_len, str_len, level;
+#if YYJSON_WRITER_DEPTH_LIMIT
+    usize ctn_depth = 0;
+#endif
     const u8 *str_ptr;
     const char_enc_type *enc_table = get_enc_table_with_flag(flg);
     const u8 *hex_table = get_hex_table_with_flag(flg);
@@ -10200,7 +10259,16 @@ val_begin:
         ctn_len_tmp = unsafe_yyjson_get_len(val);
         ctn_obj_tmp = (val_type == YYJSON_TYPE_OBJ);
         incr_len(2 * sizeof(*ctx) + (no_indent ? 0 : level * 4));
+#if YYJSON_WRITER_DEPTH_LIMIT
+        ctn_depth++;
+        if (unlikely(ctn_depth >= (usize)YYJSON_WRITER_DEPTH_LIMIT)) {
+            goto fail_depth;
+        }
+#endif
         if (unlikely(ctn_len_tmp == 0)) {
+#if YYJSON_WRITER_DEPTH_LIMIT
+            ctn_depth--;
+#endif
             /* write empty container */
             cur = write_indent(cur, no_indent ? 0 : level, spaces);
             *cur++ = (u8)('[' | ((u8)ctn_obj_tmp << 5));
@@ -10260,6 +10328,9 @@ val_end:
     goto val_begin;
 
 ctn_end:
+#if YYJSON_WRITER_DEPTH_LIMIT
+    ctn_depth--;
+#endif
     cur -= 2;
     *cur++ = '\n';
     incr_len(level * 4);
@@ -10292,6 +10363,9 @@ fail_alloc: return_err(MEMORY_ALLOCATION, MSG_MALLOC);
 fail_type:  return_err(INVALID_VALUE_TYPE, MSG_ERR_TYPE);
 fail_num:   return_err(NAN_OR_INF, MSG_NAN_INF);
 fail_str:   return_err(INVALID_STRING, MSG_ERR_UTF8);
+#if YYJSON_WRITER_DEPTH_LIMIT
+fail_depth: return_err(DEPTH, MSG_DEPTH);
+#endif
 
 #undef return_err
 #undef incr_len
@@ -11386,3 +11460,1479 @@ yyjson_mut_val *yyjson_mut_merge_patch(yyjson_mut_doc *doc,
 }
 
 #endif /* YYJSON_DISABLE_UTILS */
+
+
+
+#if !YYJSON_DISABLE_STREAMING && !YYJSON_DISABLE_READER
+
+/*==============================================================================
+ * MARK: - Streaming JSON Reader (Public)
+ *============================================================================*/
+
+#define return_err(_code, _msg) do { \
+    yyjson_impl_sr_set_err(sr, YYJSON_READ_ERROR_##_code, (_msg)); \
+    return false; \
+} while (false)
+
+#define return_err_val(_code, _msg, _val) do { \
+    yyjson_impl_sr_set_err(sr, YYJSON_READ_ERROR_##_code, (_msg)); \
+    return (_val); \
+} while (false)
+
+/* Navigating away from a value that was never read. */
+#define SR_MSG_HELD "previous value was not consumed"
+
+void yyjson_impl_sr_set_err(yyjson_sr *sr, yyjson_read_code code,
+                            const char *msg) {
+    static const u8 empty[YYJSON_PADDING_SIZE] = { 0 };
+    u64 pos = yyjson_sr_pos(sr);
+    if (sr->fail) return;
+    if (!sr->cur) {
+        sr->cur = empty;
+        sr->end = empty;
+    }
+    sr->fail = true;
+    sr->err.code = code;
+    sr->err.msg = msg;
+    sr->err.pos = (usize)yyjson_min(pos, (u64)USIZE_MAX);
+}
+
+/** Refill the window, preserving bytes in [from, end).
+    `from` must satisfy `win <= from <= cur <= end`.
+    Returns true if new bytes arrived; false on error or clean EOF. */
+static_noinline bool sr_refill(yyjson_sr *sr, const u8 *from) {
+    usize len, cur_ofs, normal_cap, want, got;
+    u8 *win = sr->win, probe;
+    if (unlikely(sr->fail || sr->eof || !sr->fn)) return false;
+
+    len = (usize)(sr->end - from);
+    cur_ofs = (usize)(sr->cur - from);
+    sr->ofs += (u64)(from - win);
+    if (len && from != win) memmove(win, from, len); /* slide to head */
+
+    /* content bytes before trailing padding */
+    normal_cap = sr->win_cap - YYJSON_PADDING_SIZE;
+    sr->cur = win + cur_ofs;
+    sr->end = win + len;
+
+    /* full window: probe 1 byte on stack */
+    if (len == normal_cap) {
+        memset(win + len, 0, YYJSON_PADDING_SIZE);
+        got = sr->fn(sr->ctx, &probe, 1);
+        if (got == ((usize)-1)) {
+            return_err(IO, "input callback failed");
+        }
+        if (got) {
+            return_err(BUFFER_LIMIT, "value does not fit in the stream buffer");
+        }
+        sr->eof = true; /* clean eof no err */
+        return false;
+    }
+
+    want = normal_cap - len;
+    got = sr->fn(sr->ctx, win + len, want);
+    if (got == ((usize)-1)) {
+        memset(win + len, 0, YYJSON_PADDING_SIZE);
+        return_err(IO, "input callback failed");
+    }
+    if (got == 0) sr->eof = true;
+    got = yyjson_min(got, want);
+    sr->end = win + len + got;
+    memset(win + len + got, 0, YYJSON_PADDING_SIZE);
+    return got > 0;
+}
+
+/** Skip whitespace, refilling as needed.
+    Returns false on error or clean EOF (no error for EOF). */
+static_inline bool sr_skip_space(yyjson_sr *sr) {
+    while (true) {
+        const u8 *cur = yyjson_impl_sr_skip_space(sr->cur);
+        if (cur < sr->end) {
+            sr->cur = cur;
+            return true;
+        }
+        sr->cur = sr->end;
+        if (!sr_refill(sr, sr->end)) return false;
+    }
+}
+
+/** Memory-mode read fn; `ctx` is the reader. */
+static usize sr_memory_read(void *ctx, void *dst, usize cap) {
+    yyjson_sr *sr = (yyjson_sr *)ctx;
+    usize left = (usize)(sr->mem_end - sr->mem_cur);
+    usize len = yyjson_min(left, cap);
+    memcpy(dst, sr->mem_cur, len);
+    sr->mem_cur += len;
+    return len;
+}
+
+bool yyjson_sr_init_mem(yyjson_sr *sr, char *src, usize len,
+                        void *buf, usize buf_cap, yyjson_read_flag flg) {
+    if (!sr) return false;
+    memset(sr, 0, sizeof(*sr));
+    sr->flg = flg;
+    if (!src) return_err(INVALID_PARAMETER, "input `src` is NULL");
+    if (!buf) return_err(INVALID_PARAMETER, "input `buf` is NULL");
+    if (unlikely(len >= USIZE_MAX - YYJSON_PADDING_SIZE)) {
+        return_err(INVALID_PARAMETER, "invalid input length");
+    }
+
+    if (flg & YYJSON_READ_INSITU) {
+        /* in-situ: input is the window; buf is only the container stack */
+        u8 *tmp = (u8 *)buf;
+        if (!buf_cap) return_err(INVALID_PARAMETER, "buf_cap too small");
+        memset(src + len, 0, YYJSON_PADDING_SIZE);
+        sr->eof = true;
+        sr->win = (u8 *)src;
+        sr->cur = (const u8 *)src;
+        sr->end = (const u8 *)src + len;
+        sr->tmp = tmp;
+        sr->stk = tmp + buf_cap;
+#if YYJSON_READER_DEPTH_LIMIT
+        sr->max_depth = yyjson_min(buf_cap, (usize)YYJSON_READER_DEPTH_LIMIT);
+#else
+        sr->max_depth = buf_cap;
+#endif
+        return true;
+    } else {
+        /* read-only mem: reuse the pull-callback path */
+        bool suc = yyjson_sr_init_fn(
+            sr, sr_memory_read, sr, buf, buf_cap, flg);
+        sr->mem_cur = (const u8 *)src;
+        sr->mem_end = (const u8 *)src + len;
+        return suc;
+    }
+}
+
+bool yyjson_sr_init_fn(yyjson_sr *sr, yyjson_sr_read_fn fn,
+                       void *ctx, void *buf, usize buf_cap,
+                       yyjson_read_flag flg) {
+    u8 *win = (u8 *)buf;
+    usize max, win_cap = YYJSON_SR_MIN_WINDOW;
+
+    if (!sr) return false;
+    memset(sr, 0, sizeof(*sr));
+    sr->flg = flg;
+    if (!fn) return_err(INVALID_PARAMETER, "input `fn` is NULL");
+    if (!buf) return_err(INVALID_PARAMETER, "input `buf` is NULL");
+    if (buf_cap < YYJSON_SR_MIN_BUF) {
+        return_err(INVALID_PARAMETER, "buf_cap too small");
+    }
+
+    /* layout: [window][scratch --> <-- stack] */
+    max = yyjson_min(buf_cap / 2, YYJSON_SR_MAX_WINDOW);
+    while (win_cap <= max / 2) win_cap *= 2;
+    sr->win = win;
+    sr->win_cap = win_cap;
+    sr->tmp = win + sr->win_cap;
+    sr->stk = win + buf_cap;
+    memset(win, 0, YYJSON_PADDING_SIZE);
+    sr->cur = win;
+    sr->end = win;
+    sr->fn = fn;
+    sr->ctx = ctx;
+#if YYJSON_READER_DEPTH_LIMIT
+    sr->max_depth = yyjson_min(buf_cap - win_cap,
+                               (usize)YYJSON_READER_DEPTH_LIMIT);
+#else
+    sr->max_depth = buf_cap - win_cap;
+#endif
+    return true;
+}
+
+#if !YYJSON_FREESTANDING && !YYJSON_DISABLE_FILE
+static usize sr_file_read(void *ctx, void *dst, usize cap) {
+    FILE *fp = (FILE *)ctx;
+    usize len = fread_safe(dst, cap, fp);
+    if (len < cap && ferror(fp)) return ((usize)-1);
+    return len;
+}
+
+bool yyjson_sr_init_fp(yyjson_sr *sr, FILE *fp, void *buf,
+                       usize buf_cap, yyjson_read_flag flg) {
+    if (!sr) return false;
+    if (!fp) {
+        memset(sr, 0, sizeof(*sr));
+        sr->flg = flg;
+        return_err(INVALID_PARAMETER, "input `fp` is NULL");
+    }
+    return yyjson_sr_init_fn(sr, sr_file_read, fp, buf, buf_cap, flg);
+}
+#endif /* !YYJSON_FREESTANDING && !YYJSON_DISABLE_FILE */
+
+#if !YYJSON_DISABLE_UTF8_VALIDATION
+
+static_inline const u8 *sr_skip_utf8(const u8 *cur) {
+    u32 uni = byte_load_4(cur);
+    u32 tmp;
+    while (is_utf8_seq3(uni)) {
+        cur += 3;
+        uni = byte_load_4(cur);
+    }
+    if (is_utf8_seq1(uni)) return cur;
+    while (is_utf8_seq2(uni)) {
+        cur += 2;
+        uni = byte_load_4(cur);
+    }
+    while (is_utf8_seq4(uni)) {
+        cur += 4;
+        uni = byte_load_4(cur);
+    }
+    return cur;
+}
+
+static bool sr_utf8_is_valid(const u8 *src, usize len) {
+    const u8 *cur = src, *end = src + len;
+    while (cur < end) {
+        const u8 *pos;
+        while ((usize)(end - cur) >= sizeof(usize)) {
+            usize w = yyjson_impl_word_load(cur);
+            if (w & YYJSON_WORD_80) break;
+            cur += sizeof(usize);
+        }
+        /* padding zeros are ASCII (< 0x80). */
+        while (cur < end && *cur < 0x80) cur++;
+        if (cur >= end) return true;
+        pos = cur;
+        cur = sr_skip_utf8(cur);
+        if (cur >= end) return true;
+        if (pos == cur) return false;
+    }
+    return true;
+}
+
+/** Scan a clean UTF-8 string suffix and return its closing quote. */
+const u8 *yyjson_impl_sr_scan_str_utf8(const u8 *src) {
+    const u8 *cur = src;
+    while (true) {
+        const u8 *pos;
+        while (true) {
+            usize w = yyjson_impl_word_load(cur);
+            if (yyjson_impl_word_has_byte(w, '"') |
+                yyjson_impl_word_has_byte(w, '\\') |
+                yyjson_impl_word_has_ctrl(w) |
+                (w & YYJSON_WORD_80)) break;
+            cur += sizeof(usize);
+        }
+        while (*cur < 0x80) {
+            if (*cur == '"') return cur;
+            if (*cur == '\\' || *cur < 0x20) return NULL;
+            cur++;
+        }
+        pos = cur;
+        cur = sr_skip_utf8(cur);
+        if (pos == cur) return NULL;
+    }
+}
+#endif /* !YYJSON_DISABLE_UTF8_VALIDATION */
+
+static bool sr_tmp_reserve(yyjson_sr *sr, usize used, usize add) {
+    usize cap = (usize)(sr->stk - sr->tmp);
+    usize need;
+    if (size_add_is_overflow(used, add)) {
+        return_err(BUFFER_LIMIT, "value exceeds scratch capacity");
+    }
+    need = used + add;
+    if (need > USIZE_MAX - YYJSON_PADDING_SIZE ||
+        need + YYJSON_PADDING_SIZE > cap) {
+        return_err(BUFFER_LIMIT, "value exceeds scratch capacity");
+    }
+    return true;
+}
+
+static_inline usize sr_write_utf8(u8 *dst, u32 cp) {
+    if (cp < 0x80) {
+        dst[0] = (u8)cp;
+        return 1;
+    } else if (cp < 0x800) {
+        dst[0] = (u8)(0xC0 | (cp >> 6));
+        dst[1] = (u8)(0x80 | (cp & 0x3F));
+        return 2;
+    } else if (cp < 0x10000) {
+        dst[0] = (u8)(0xE0 | (cp >> 12));
+        dst[1] = (u8)(0x80 | ((cp >> 6) & 0x3F));
+        dst[2] = (u8)(0x80 | (cp & 0x3F));
+        return 3;
+    } else {
+        dst[0] = (u8)(0xF0 | (cp >> 18));
+        dst[1] = (u8)(0x80 | ((cp >> 12) & 0x3F));
+        dst[2] = (u8)(0x80 | ((cp >> 6) & 0x3F));
+        dst[3] = (u8)(0x80 | (cp & 0x3F));
+        return 4;
+    }
+}
+
+/** Decode one escape at `src` (points at '\\') within [src, end).
+    Sets `*src_len` / `*dst_len`. Returns 0, 1 (need more), or -1. */
+static i32 sr_decode_escape(const u8 *src, const u8 *end, u8 *dst,
+                            usize *src_len, usize *dst_len) {
+    u16 hi, lo;
+    if ((usize)(end - src) < 2) return 1;
+    switch (src[1]) {
+    case '"':  *dst = '"';  *src_len = 2; *dst_len = 1; return 0;
+    case '\\': *dst = '\\'; *src_len = 2; *dst_len = 1; return 0;
+    case '/':  *dst = '/';  *src_len = 2; *dst_len = 1; return 0;
+    case 'b':  *dst = '\b'; *src_len = 2; *dst_len = 1; return 0;
+    case 'f':  *dst = '\f'; *src_len = 2; *dst_len = 1; return 0;
+    case 'n':  *dst = '\n'; *src_len = 2; *dst_len = 1; return 0;
+    case 'r':  *dst = '\r'; *src_len = 2; *dst_len = 1; return 0;
+    case 't':  *dst = '\t'; *src_len = 2; *dst_len = 1; return 0;
+    case 'u':
+        if ((usize)(end - src) < 6) return 1;
+        if (!hex_load_4(src + 2, &hi)) return -1;
+        if (hi >= 0xD800 && hi <= 0xDBFF) {
+            if ((usize)(end - src) < 12) return 1;
+            if (src[6] != '\\' || src[7] != 'u') return -1;
+            if (!hex_load_4(src + 8, &lo)) return -1;
+            if (lo < 0xDC00 || lo > 0xDFFF) return -1;
+            *dst_len = sr_write_utf8(dst, 0x10000u + (((u32)hi - 0xD800u) << 10)
+                                     + ((u32)lo - 0xDC00u));
+            *src_len = 12;
+            return 0;
+        }
+        if (hi >= 0xDC00 && hi <= 0xDFFF) return -1; /* lone low surrogate */
+        *dst_len = sr_write_utf8(dst, hi);
+        *src_len = 6;
+        return 0;
+    default:
+        return -1;
+    }
+}
+
+/** Resume a structural skip in [cur, end).
+    Returns true with `*next` past the value; false if the window ends.
+    Twin of `yyjson_impl_sr_skip_window()`, which starts a fresh value;
+    keep the two in sync. */
+static bool sr_skip_resume(const u8 *cur, const u8 *end,
+                           const u8 **next, yyjson_sr_skip_state *st) {
+    usize nest = st->depth;
+    if (st->mode == YYJSON_SR_SKIP_RAW) {
+        cur = yyjson_impl_sr_skip_class(cur, YYJSON_SR_CHAR_DELIM, false);
+        if (cur >= end) return false;
+        *next = cur;
+        return true;
+    }
+    if (st->mode != YYJSON_SR_SKIP_CTN) {
+        if (st->mode == YYJSON_SR_SKIP_ESC) {
+            if (cur >= end) return false;
+            cur++;
+            st->mode = YYJSON_SR_SKIP_STR;
+        }
+        while (true) {
+            cur = yyjson_impl_sr_skip_str_relaxed(cur);
+            if (cur >= end) return false;
+            if (*cur++ == '"') break;
+            if (cur >= end) {
+                st->mode = YYJSON_SR_SKIP_ESC;
+                return false;
+            }
+            cur++;
+        }
+        st->mode = YYJSON_SR_SKIP_CTN;
+        if (!nest) {
+            *next = cur;
+            return true;
+        }
+    }
+    /* container drain: nest >= 1 here. */
+    while (cur < end) {
+        cur = yyjson_impl_sr_skip_class(cur, YYJSON_SR_CHAR_STRUCT, false);
+        if (cur >= end) break;
+        if (*cur == '"') {
+            cur++;
+            while (true) {
+                cur = yyjson_impl_sr_skip_str_relaxed(cur);
+                if (cur >= end) {
+                    st->depth = nest;
+                    st->mode = YYJSON_SR_SKIP_STR;
+                    return false;
+                }
+                if (*cur++ == '"') break;
+                if (cur >= end) {
+                    st->depth = nest;
+                    st->mode = YYJSON_SR_SKIP_ESC;
+                    return false;
+                }
+                cur++;
+            }
+        } else if (*cur == '[' || *cur == '{') {
+            nest++;
+            cur++;
+        } else {
+            cur++;
+            if (--nest == 0) {
+                *next = cur;
+                return true;
+            }
+        }
+    }
+    st->depth = nest;
+    return false;
+}
+
+static_inline bool sr_skip_more(yyjson_sr *sr, yyjson_sr_skip_state st,
+                                usize *raw_len) {
+    while (true) {
+        const u8 *start = sr->cur, *next, *stop;
+        bool done = sr_skip_resume(start, sr->end, &next, &st);
+        stop = done ? next : sr->end;
+        if (raw_len) {
+            usize len = (usize)(stop - start);
+            if (!sr_tmp_reserve(sr, *raw_len, len)) return false;
+            memcpy(sr->tmp + *raw_len, start, len);
+            *raw_len += len;
+        }
+        if (done) {
+            sr->cur = next;
+            return true;
+        }
+        sr->cur = sr->end;
+        if (!sr_refill(sr, sr->end)) {
+            if (sr->fail) return false;
+            if (st.mode == YYJSON_SR_SKIP_RAW) return true;
+            return_err(UNEXPECTED_END, st.mode != YYJSON_SR_SKIP_CTN ?
+                       "unclosed string" : "unclosed container");
+        }
+    }
+}
+
+bool yyjson_impl_sr_skip_more(yyjson_sr *sr, yyjson_sr_skip_state st) {
+    return sr_skip_more(sr, st, NULL);
+}
+
+/** Skip one value at the cursor.
+    Skipped containers only track strings and nesting. */
+static_inline bool sr_skip_value(yyjson_sr *sr) {
+    yyjson_sr_skip_state st = { 0, YYJSON_SR_SKIP_CTN };
+    u8 c;
+    if (!sr_skip_space(sr)) {
+        return_err(UNEXPECTED_END, "expected value");
+    }
+    c = *sr->cur;
+    if (c == '"') {
+        sr->cur++;
+        st.mode = YYJSON_SR_SKIP_STR;
+    } else if (c == '[' || c == '{') {
+        sr->cur++;
+        st.depth = 1;
+    } else if (yyjson_sr_char_is(c, DELIM)) {
+        return_err(UNEXPECTED_CHARACTER, "expected value");
+    } else {
+        st.mode = YYJSON_SR_SKIP_RAW;
+    }
+    return yyjson_impl_sr_skip_more(sr, st);
+}
+
+yyjson_type yyjson_impl_sr_peek_type(yyjson_sr *sr) {
+    if (!sr_skip_space(sr)) return YYJSON_TYPE_NONE;
+    return (yyjson_type)(yyjson_sr_char_table[*sr->cur] & YYJSON_TYPE_MASK);
+}
+
+bool yyjson_impl_sr_ctn_begin_slow(yyjson_sr *sr, u8 token) {
+    if (sr->fail) return false;
+    if (!sr_skip_space(sr)) {
+        return_err(UNEXPECTED_END, "expected container");
+    }
+    if (*sr->cur != token) {
+        return_err(UNEXPECTED_CHARACTER, token == '[' ?
+                   "expected array" : "expected object");
+    }
+    if (sr->depth >= sr->max_depth) {
+#if YYJSON_READER_DEPTH_LIMIT
+        if (sr->depth >= (usize)YYJSON_READER_DEPTH_LIMIT) {
+            return_err(DEPTH, "nesting depth limit exceeded");
+        }
+#endif
+        return_err(BUFFER_LIMIT, "container stack exceeds working buffer");
+    }
+    sr->cur++;
+    sr->stk--;
+    *sr->stk = (u8)(token + 2); /* `[` --> `]`, `{` --> `}` */
+    sr->depth++;
+    sr->st = YYJSON_SR_ST_NONE;
+    return true;
+}
+
+bool yyjson_impl_sr_arr_next(yyjson_sr *sr) {
+    u8 c;
+    if (sr->fail) return false;
+    if (!sr->depth || *sr->stk != ']') {
+        return_err(JSON_STRUCTURE, "array operation outside an array");
+    }
+    if (sr->st == YYJSON_SR_ST_HELD) return_err(JSON_STRUCTURE, SR_MSG_HELD);
+    if (!sr_skip_space(sr)) {
+        return_err(UNEXPECTED_END, "unclosed array");
+    }
+    c = *sr->cur;
+    if (sr->st == YYJSON_SR_ST_DONE) {
+        if (c == ']') return false;
+        if (c != ',') {
+            return_err(UNEXPECTED_CHARACTER, "expected ',' or ']' in array");
+        }
+        sr->cur++;
+        if (!sr_skip_space(sr)) {
+            return_err(UNEXPECTED_END, "unclosed array");
+        }
+        if (*sr->cur == ']') {
+            return_err(UNEXPECTED_CHARACTER, "trailing comma in array");
+        }
+    } else if (c == ']') {
+        return false;
+    }
+    sr->st = YYJSON_SR_ST_HELD;
+    return true;
+}
+
+bool yyjson_impl_sr_ctn_end_slow(yyjson_sr *sr, u8 token) {
+    yyjson_sr_skip_state st = { 1, YYJSON_SR_SKIP_CTN };
+    if (sr->fail) return false;
+    if (!sr->depth || *sr->stk != token) {
+        return_err(JSON_STRUCTURE,
+                   "container type does not match its begin token");
+    }
+    if (!yyjson_impl_sr_skip_more(sr, st)) return false;
+    if (sr->cur[-1] != token) {
+        return_err(UNEXPECTED_CHARACTER, token == ']' ?
+                   "expected array end" : "expected object end");
+    }
+    sr->stk++;
+    sr->depth--;
+    sr->st = YYJSON_SR_ST_DONE;
+    return true;
+}
+
+/** Preserve a window-backed key before a refill invalidates its view. */
+static bool sr_keep_key(yyjson_sr *sr, yyjson_sv *key) {
+    if (!sr->fn || key->ptr == (const char *)sr->tmp) return true;
+    if (!sr_tmp_reserve(sr, key->len, 0)) return false;
+    memcpy(sr->tmp, key->ptr, key->len);
+    memset(sr->tmp + key->len, 0, YYJSON_PADDING_SIZE);
+    key->ptr = (const char *)sr->tmp;
+    return true;
+}
+
+/** Read the next key and leave the cursor at its value. */
+static bool sr_next_key(yyjson_sr *sr, yyjson_sv *key) {
+    const u8 *p;
+    if (!sr->depth || *sr->stk != '}') {
+        return_err(JSON_STRUCTURE, "object operation outside an object");
+    }
+    if (sr->st == YYJSON_SR_ST_HELD) return_err(JSON_STRUCTURE, SR_MSG_HELD);
+    if (!sr_skip_space(sr)) {
+        return_err(UNEXPECTED_END, "unclosed object");
+    }
+    if (*sr->cur == '}') return false;
+    if (sr->st == YYJSON_SR_ST_DONE) {
+        if (*sr->cur != ',') {
+            return_err(UNEXPECTED_CHARACTER, "expected ',' or '}' in object");
+        }
+        sr->cur++;
+        if (!sr_skip_space(sr)) {
+            return_err(UNEXPECTED_END, "unclosed object");
+        }
+        if (*sr->cur == '}') {
+            return_err(UNEXPECTED_CHARACTER, "trailing comma in object");
+        }
+    }
+    if (*sr->cur != '"') {
+        return_err(UNEXPECTED_CHARACTER, "expected object key");
+    }
+    *key = yyjson_sr_read_str(sr);
+    if (sr->fail) return false;
+    p = yyjson_impl_sr_skip_space(sr->cur);
+    if (p >= sr->end) {
+        if (!sr_keep_key(sr, key)) return false;
+        sr->cur = p;
+        if (!sr_skip_space(sr)) {
+            return_err(UNEXPECTED_END, "expected ':'");
+        }
+        p = sr->cur;
+    }
+    if (*p != ':') {
+        return_err(UNEXPECTED_CHARACTER, "expected ':'");
+    }
+    p = yyjson_impl_sr_skip_space(p + 1);
+    if (p >= sr->end) {
+        if (!sr_keep_key(sr, key)) return false;
+        sr->cur = p;
+        if (!sr_skip_space(sr)) return_err(UNEXPECTED_END, "expected value");
+    } else {
+        sr->cur = p;
+    }
+    sr->st = YYJSON_SR_ST_HELD;
+    return true;
+}
+
+bool yyjson_sr_obj_next(yyjson_sr *sr, yyjson_sv *key) {
+    if (!sr || sr->fail) return false;
+    if (!key) return_err(INVALID_PARAMETER, "object key output is NULL");
+    return sr_next_key(sr, key);
+}
+
+bool yyjson_impl_sr_obj_findn(yyjson_sr *sr, const char *key, usize key_len) {
+    if (sr->fail) return false;
+    if (!sr->depth || *sr->stk != '}') {
+        return_err(JSON_STRUCTURE, "object operation outside an object");
+    }
+    if (sr->st == YYJSON_SR_ST_HELD) return_err(JSON_STRUCTURE, SR_MSG_HELD);
+    while (true) {
+        {
+            /* this is the error-reporting twin of the scan in
+               `yyjson_sr_obj_findn()`; keep the two in sync */
+            const u8 *cur = sr->cur, *end = sr->end;
+            bool need_comma = (sr->st == YYJSON_SR_ST_DONE);
+            while (true) {
+                const u8 *ks, *ke, *p;
+                bool matched;
+                cur = yyjson_impl_sr_skip_space(cur);
+                if (cur >= end) break;
+                if (*cur == '}') {
+                    sr->cur = cur;
+                    return false; /* not found; close remains for obj_end */
+                }
+                if (need_comma) {
+                    if (*cur != ',') {
+                        sr->cur = cur;
+                        return_err(UNEXPECTED_CHARACTER,
+                                   "expected ',' or '}' in object");
+                    }
+                    cur = yyjson_impl_sr_skip_space(cur + 1);
+                    if (cur >= end) break;
+                    if (*cur == '}') {
+                        sr->cur = cur;
+                        return_err(UNEXPECTED_CHARACTER,
+                                   "trailing comma in object");
+                    }
+                }
+                if (*cur != '"') {
+                    sr->cur = cur;
+                    return_err(UNEXPECTED_CHARACTER, "expected object key");
+                }
+                ks = cur + 1;
+                matched = (usize)(end - ks) > key_len &&
+                          ks[key_len] == '"' &&
+                          memcmp(ks, key, key_len) == 0;
+                if (matched) {
+                    /* an escaped key needs decoding before it can match */
+                    if (yyjson_impl_sr_key_needs_check(key, key_len)) goto slow;
+                    ke = ks + key_len + 1;
+                } else {
+                    p = yyjson_impl_sr_skip_str_relaxed(ks);
+                    if (p >= end) break;
+                    if (*p == '\\') goto slow; /* escaped key: rare */
+                    ke = p + 1;
+                }
+                p = ke;
+                if (*p == ':') {
+                    p++;
+                } else {
+                    p = yyjson_impl_sr_skip_space(p);
+                    if (p >= end) break;
+                    if (*p != ':') {
+                        sr->cur = p;
+                        return_err(UNEXPECTED_CHARACTER, "expected ':'");
+                    }
+                    p++;
+                }
+                if (*p == ' ') {
+                    p++;
+                    if (*p == ' ') {
+                        p = yyjson_impl_sr_skip_space(p);
+                    }
+                } else {
+                    p = yyjson_impl_sr_skip_space(p);
+                }
+                if (p >= end) break;
+                if (matched) {
+                    sr->cur = p;
+                    sr->st = YYJSON_SR_ST_HELD;
+                    return true;
+                }
+                {
+                    yyjson_sr_skip_state st;
+                    if (!yyjson_impl_sr_skip_window(p, end, &cur, &st)) {
+                        /* cross-window: finish via continuation, resume */
+                        sr->cur = end;
+                        if (!yyjson_impl_sr_skip_more(sr, st)) return false;
+                        sr->st = YYJSON_SR_ST_DONE;
+                        cur = sr->cur;
+                        end = sr->end;
+                        need_comma = true;
+                        continue;
+                    }
+                }
+                need_comma = true;
+                sr->cur = cur;
+                sr->st = YYJSON_SR_ST_DONE;
+            }
+        }
+
+slow:
+        {
+            /* cross-window: process exactly one member with refills,
+               then go back to the fast in-window scan */
+            yyjson_sv found;
+            bool matched;
+            if (!sr_next_key(sr, &found)) return false;
+            matched = found.len == key_len &&
+                      memcmp(found.ptr, key, key_len) == 0;
+            if (matched) return true;
+            if (!sr_skip_value(sr)) return false;
+            sr->st = YYJSON_SR_ST_DONE;
+        }
+    }
+}
+
+yyjson_sv yyjson_impl_sr_read_str(yyjson_sr *sr) {
+    yyjson_sv sv = { NULL, 0 };
+    u8 *dst;
+    usize out = 0;
+    if (sr->fail) return sv;
+    if (!sr_skip_space(sr)) {
+        return_err_val(UNEXPECTED_END, "expected string", sv);
+    }
+    if (*sr->cur != '"') {
+        return_err_val(UNEXPECTED_CHARACTER, "expected string", sv);
+    }
+    {
+        /* Retry the zero-copy path: the whole clean string may now be visible.
+           The inline path can fail merely because of leading whitespace. */
+        const u8 *start = sr->cur + 1;
+        const u8 *p;
+#if YYJSON_DISABLE_UTF8_VALIDATION
+        p = yyjson_impl_sr_skip_str(start);
+#elif YYJSON_DISABLE_NON_STANDARD
+        p = yyjson_impl_sr_scan_str_utf8(start);
+#else
+        if (sr->flg & YYJSON_READ_ALLOW_INVALID_UNICODE) {
+            p = yyjson_impl_sr_skip_str(start);
+        } else {
+            p = yyjson_impl_sr_scan_str_utf8(start);
+        }
+#endif
+        if (p && p < sr->end && *p == '"') {
+            sv.ptr = (const char *)start;
+            sv.len = (usize)(p - start);
+            *constcast(u8 *)p = '\0';
+            sr->cur = p + 1;
+            sr->st = YYJSON_SR_ST_DONE;
+            return sv;
+        }
+    }
+
+    /* decode into mutable input or the scratch area across boundaries */
+    dst = sr->fn ? sr->tmp : constcast(u8 *)(sr->cur + 1);
+    sr->cur++; /* past the opening quote */
+    while (true) {
+        const u8 *s = sr->cur, *end = sr->end, *p = s;
+        usize run;
+        u8 c;
+        p = yyjson_impl_sr_skip_str(p);
+        run = (usize)(p - s);
+        if (run) {
+            if (sr->fn && !sr_tmp_reserve(sr, out, run)) return sv;
+            memmove(dst + out, s, run);
+            out += run;
+        }
+        sr->cur = p;
+        if (p >= end) {
+            if (!sr_refill(sr, sr->end)) {
+                return_err_val(UNEXPECTED_END, "unclosed string", sv);
+            }
+            continue;
+        }
+        c = *p;
+        if (c == '"') {
+            sr->cur = p + 1;
+            break;
+        }
+        if (c < 0x20) {
+            return_err_val(INVALID_STRING,
+                           "unescaped control character in string", sv);
+        }
+
+        /* escape sequence */
+        while (true) {
+            usize sl, dl;
+            int rc;
+            if (sr->fn && !sr_tmp_reserve(sr, out, 4)) return sv; /* UTF-8 */
+            rc = sr_decode_escape(sr->cur, sr->end, dst + out, &sl, &dl);
+            if (rc == 0) {
+                sr->cur += sl;
+                out += dl;
+                break;
+            }
+            if (rc < 0) {
+                return_err_val(INVALID_STRING, "invalid escape sequence", sv);
+            }
+            if (!sr_refill(sr, sr->cur)) {
+                return_err_val(UNEXPECTED_END, "truncated escape sequence", sv);
+            }
+        }
+    }
+    if (out) {
+        if (!sr->fn) {
+            dst[out] = '\0';
+        } else {
+            memset(sr->tmp + out, 0, YYJSON_PADDING_SIZE);
+        }
+#if !YYJSON_DISABLE_UTF8_VALIDATION
+        if (
+#if !YYJSON_DISABLE_NON_STANDARD
+            !(sr->flg & YYJSON_READ_ALLOW_INVALID_UNICODE) &&
+#endif
+            !sr_utf8_is_valid(dst, out)) {
+            return_err_val(INVALID_STRING, "invalid UTF-8 in string", sv);
+        }
+#endif
+    }
+    sv.ptr = out ? (const char *)dst : "";
+    sv.len = out;
+    sr->st = YYJSON_SR_ST_DONE;
+    return sv;
+}
+
+/**
+ Parse one number token. Returns the token end, or NULL on failure. */
+const char *yyjson_impl_sr_parse_num(const char *dat, yyjson_val *val) {
+    u8 *cur = constcast(u8 *)dat;
+    u8 raw_end[1];
+    u8 *raw_ptr = raw_end;
+    const char *msg;
+    if (unlikely(!read_num(&cur, &raw_ptr, 0, val, &msg))) return NULL;
+    return (const char *)cur;
+}
+
+/** Parse one number token, support the RAW number flags. */
+static_noinline const char *sr_parse_num(const char *dat, yyjson_val *val,
+                                         yyjson_read_flag flg,
+                                         const char **msg) {
+    u8 *cur = constcast(u8 *)dat;
+    u8 raw_end[1];
+    u8 *raw_ptr = raw_end;
+    *msg = NULL;
+    if (unlikely(!read_num(&cur, &raw_ptr, flg, val, msg))) return NULL;
+    return (const char *)cur;
+}
+
+/** Strictly parse a number, returning RAW for generic reads when requested. */
+bool yyjson_impl_sr_read_num(yyjson_sr *sr, yyjson_val *v, u8 kind) {
+    yyjson_read_flag flg;
+    const char *ret, *msg;
+    const u8 *rp;
+    if (sr->fail) return false;
+    flg = kind == YYJSON_SR_NUM_ANY ?
+          sr->flg & (YYJSON_READ_NUMBER_AS_RAW |
+                     YYJSON_READ_BIGNUM_AS_RAW) : 0;
+    memset(v, 0, sizeof(*v));
+    if (!sr_skip_space(sr)) return_err(UNEXPECTED_END, "expected number");
+    ret = sr_parse_num((const char *)sr->cur, v, flg, &msg);
+    if (ret) {
+        rp = (const u8 *)ret;
+        if (rp < sr->end) {
+            if (!yyjson_sr_char_is(*rp, DELIM)) {
+                return_err(INVALID_NUMBER, "invalid number");
+            }
+            sr->cur = rp;
+            sr->st = YYJSON_SR_ST_DONE;
+        } else if (sr->eof) {
+            sr->cur = rp;
+            sr->st = YYJSON_SR_ST_DONE;
+        } else {
+            ret = NULL;
+        }
+    } else if (sr->eof) {
+        return_err(INVALID_NUMBER, msg ? msg : "invalid number");
+    }
+    if (!ret) {
+        yyjson_sv raw = yyjson_sr_read_raw(sr);
+        if (sr->fail) return false;
+        memset(v, 0, sizeof(*v));
+        ret = sr_parse_num(raw.ptr, v, flg, &msg);
+        if (!ret || ret != raw.ptr + raw.len) {
+            return_err(INVALID_NUMBER, msg ? msg : "invalid number");
+        }
+    }
+    if (kind == YYJSON_SR_NUM_ANY) return true;
+    if (kind == YYJSON_SR_NUM_UINT && yyjson_is_uint(v)) return true;
+    if (kind == YYJSON_SR_NUM_SINT &&
+        (yyjson_is_sint(v) ||
+         (yyjson_is_uint(v) && yyjson_get_uint(v) <= I64_MAX))) return true;
+    if (kind == YYJSON_SR_NUM_REAL && yyjson_is_num(v)) return true;
+    if (kind == YYJSON_SR_NUM_UINT) {
+        return_err(INVALID_NUMBER, "number is not an unsigned integer");
+    }
+    if (kind == YYJSON_SR_NUM_SINT) {
+        return_err(INVALID_NUMBER, "number is not a signed integer");
+    }
+    return_err(INVALID_NUMBER, "value is not a number");
+}
+
+static bool sr_match_lit(yyjson_sr *sr, const char *lit, usize len) {
+    const u8 *cur;
+    usize left;
+    /* keep the following delimiter visible; EOF padding supplies it */
+    while ((usize)(sr->end - sr->cur) <= len && !sr->eof) {
+        if (!sr_refill(sr, sr->cur)) break;
+    }
+    cur = sr->cur;
+    left = (usize)(sr->end - cur);
+    if (left >= len && memcmp(cur, lit, len) == 0 &&
+        yyjson_sr_char_is(cur[len], DELIM) &&
+        (left > len || sr->eof)) {
+        sr->cur = cur + len;
+        sr->st = YYJSON_SR_ST_DONE;
+        return true;
+    }
+    return false;
+}
+
+bool yyjson_impl_sr_read_bool(yyjson_sr *sr) {
+    if (sr->fail) return false;
+    if (!sr_skip_space(sr)) return_err(UNEXPECTED_END, "expected boolean");
+    if (sr_match_lit(sr, "true", 4)) return true;
+    if (sr_match_lit(sr, "false", 5)) return false;
+    return_err(LITERAL, "expected 'true' or 'false'");
+}
+
+bool yyjson_impl_sr_read_null(yyjson_sr *sr) {
+    if (sr->fail) return false;
+    if (!sr_skip_space(sr)) return_err(UNEXPECTED_END, "expected null");
+    if (sr_match_lit(sr, "null", 4)) return true;
+    return_err(LITERAL, "expected 'null'");
+}
+
+yyjson_sv yyjson_sr_read_raw(yyjson_sr *sr) {
+    yyjson_sv sv = { NULL, 0 };
+    yyjson_sr_skip_state st;
+    const u8 *start, *next;
+    usize out = 0;
+
+    if (!sr || sr->fail) return sv;
+    if (!sr_skip_space(sr)) {
+        return_err_val(UNEXPECTED_END, "expected value", sv);
+    }
+    start = sr->cur;
+    if (*start == '[' || *start == '{') {
+        return_err_val(UNEXPECTED_CHARACTER, "expected scalar value", sv);
+    }
+    if (yyjson_sr_char_is(*start, DELIM)) {
+        return_err_val(UNEXPECTED_CHARACTER, "expected scalar value", sv);
+    }
+    if (yyjson_impl_sr_skip_window(start, sr->end, &next, &st)) {
+        sv.ptr = (const char *)start;
+        sv.len = (usize)(next - start);
+        sr->cur = next;
+        sr->st = YYJSON_SR_ST_DONE;
+        return sv;
+    }
+    if (st.mode == YYJSON_SR_SKIP_RAW && sr->eof) {
+        sv.ptr = (const char *)start;
+        sv.len = (usize)(sr->end - start);
+        sr->cur = sr->end;
+        sr->st = YYJSON_SR_ST_DONE;
+        return sv;
+    }
+    out = (usize)(sr->end - start);
+    if (!sr_tmp_reserve(sr, out, 0)) return sv;
+    memcpy(sr->tmp, start, out);
+    sr->cur = sr->end;
+    if (!sr_skip_more(sr, st, &out)) return sv;
+    memset(sr->tmp + out, 0, YYJSON_PADDING_SIZE);
+    sv.ptr = (const char *)sr->tmp;
+    sv.len = out;
+    sr->st = YYJSON_SR_ST_DONE;
+    return sv;
+}
+
+bool yyjson_impl_sr_read_scalar(yyjson_sr *sr, yyjson_val *val) {
+    yyjson_type type;
+    memset(val, 0, sizeof(*val));
+    if (sr->fail) return false;
+    type = yyjson_sr_peek_type(sr);
+    switch (type) {
+        case YYJSON_TYPE_NULL: {
+            yyjson_sr_read_null(sr);
+            if (sr->fail) return false;
+            unsafe_yyjson_set_null(val);
+            return true;
+        }
+        case YYJSON_TYPE_BOOL: {
+            bool value = yyjson_sr_read_bool(sr);
+            if (sr->fail) return false;
+            unsafe_yyjson_set_bool(val, value);
+            return true;
+        }
+        case YYJSON_TYPE_NUM: {
+            *val = yyjson_sr_read_num(sr);
+            return !sr->fail;
+        }
+        case YYJSON_TYPE_STR: {
+            yyjson_sv value = yyjson_sr_read_str(sr);
+            if (sr->fail) return false;
+            unsafe_yyjson_set_strn(val, value.ptr, value.len);
+            return true;
+        }
+        default: {
+            yyjson_impl_sr_set_err(sr, YYJSON_READ_ERROR_UNEXPECTED_CHARACTER,
+                                   "expected scalar value");
+            return false;
+        }
+    }
+}
+
+bool yyjson_impl_sr_skip_value(yyjson_sr *sr) {
+    if (sr->fail) return false;
+    if (!sr_skip_value(sr)) return false;
+    sr->st = YYJSON_SR_ST_DONE;
+    return true;
+}
+
+bool yyjson_impl_sr_obj_read_num(yyjson_sr *sr, const char *key,
+                                 usize key_len, yyjson_val *num, u8 kind) {
+    if (sr->fail || !yyjson_impl_sr_obj_find_req(sr, key, key_len)) {
+        return false;
+    }
+    return yyjson_impl_sr_read_num(sr, num, kind);
+}
+
+bool yyjson_sr_finish(yyjson_sr *sr) {
+    if (!sr || sr->fail) return false;
+    if (sr->depth) {
+        return_err(JSON_STRUCTURE, "document ended inside an open container");
+    }
+    if (sr->st != YYJSON_SR_ST_DONE) {
+        if (sr->st == YYJSON_SR_ST_HELD) {
+            return_err(JSON_STRUCTURE, "current document was not consumed");
+        }
+        return_err(EMPTY_CONTENT, "no JSON value was read");
+    }
+    if (sr_skip_space(sr)) {
+        return_err(UNEXPECTED_CONTENT, "unexpected content after document");
+    }
+    return !sr->fail;
+}
+
+bool yyjson_sr_doc_next(yyjson_sr *sr) {
+    if (!sr || sr->fail) return false;
+    if (sr->depth) {
+        return_err(JSON_STRUCTURE,
+                   "next document requested inside an open container");
+    }
+    if (sr->st == YYJSON_SR_ST_HELD) {
+        return_err(JSON_STRUCTURE, "current document was not consumed");
+    }
+    if (!sr_skip_space(sr)) return false; /* clean end or sticky error */
+    sr->st = YYJSON_SR_ST_HELD;
+    return true;
+}
+
+
+#undef return_err
+#undef return_err_val
+#endif /* !YYJSON_DISABLE_STREAMING && !YYJSON_DISABLE_READER */
+
+
+
+#if !YYJSON_DISABLE_STREAMING
+
+/*==============================================================================
+ * MARK: - Streaming JSON Writer (Public)
+ *============================================================================*/
+
+#if !YYJSON_DISABLE_WRITER
+
+#define return_err(_code, _msg) do { \
+    if (!sw->fail) { \
+        sw->fail = true; \
+        sw->err.code = YYJSON_WRITE_ERROR_##_code; \
+        sw->err.msg = (_msg); \
+    } \
+    return false; \
+} while (false)
+
+static void sw_init_base(yyjson_sw *sw, void *out, usize cap,
+                         yyjson_write_flag flg) {
+    memset(sw, 0, sizeof(*sw));
+    sw->out = (u8 *)out;
+    sw->cur = (u8 *)out;
+    sw->stk = sw->out ? sw->out + cap : NULL;
+    sw->flg = flg;
+#if YYJSON_WRITER_DEPTH_LIMIT
+    sw->max_depth = (usize)YYJSON_WRITER_DEPTH_LIMIT;
+#else
+    sw->max_depth = USIZE_MAX;
+#endif
+}
+
+bool yyjson_sw_init_mem(yyjson_sw *sw, void *dst, usize dst_cap,
+                        yyjson_write_flag flg) {
+    if (!sw) return false;
+    sw_init_base(sw, dst, dst_cap, flg);
+    if (!dst || !dst_cap) {
+        return_err(INVALID_PARAMETER,
+                   "memory writer requires a non-empty buffer");
+    }
+    return true;
+}
+
+bool yyjson_sw_init_fn(yyjson_sw *sw, yyjson_sw_write_fn fn,
+                       void *ctx, void *buf, usize buf_cap,
+                       yyjson_write_flag flg) {
+    if (!sw) return false;
+    sw_init_base(sw, buf, buf_cap, flg);
+    if (!fn || !buf || buf_cap < YYJSON_SW_MIN_BUF) {
+        return_err(INVALID_PARAMETER,
+                   "stream writer requires callback and buffer >= 64 bytes");
+    }
+    sw->fn = fn;
+    sw->ctx = ctx;
+    return true;
+}
+
+#if !YYJSON_FREESTANDING && !YYJSON_DISABLE_FILE
+static bool sw_file_write(void *ctx, const void *src, usize len) {
+    return fwrite(src, 1, len, (FILE *)ctx) == len;
+}
+
+bool yyjson_sw_init_fp(yyjson_sw *sw, FILE *fp, void *buf,
+                       usize buf_cap, yyjson_write_flag flg) {
+    return yyjson_sw_init_fn(sw, fp ? sw_file_write : NULL,
+                             fp, buf, buf_cap, flg);
+}
+#endif /*  !YYJSON_FREESTANDING && !YYJSON_DISABLE_FILE */
+
+bool yyjson_impl_sw_make_room(yyjson_sw *sw, usize need) {
+    if ((usize)(sw->stk - sw->cur) >= need) return true;
+    if (!sw->fn) return_err(BUFFER_LIMIT, "streaming writer buffer is full");
+    if (!yyjson_sw_flush(sw)) return false;
+    if ((usize)(sw->stk - sw->out) >= need) return true;
+    return_err(BUFFER_LIMIT, "streaming writer buffer is full");
+}
+
+static bool sw_write_bytes(yyjson_sw *sw, const void *src, usize len) {
+    const u8 *cur = (const u8 *)src;
+    while (len) {
+        usize room, take;
+        if (!yyjson_impl_sw_make_room(sw, 1)) return false;
+        room = (usize)(sw->stk - sw->cur);
+        take = yyjson_min(len, room);
+        memcpy(sw->cur, cur, take);
+        sw->cur += take;
+        cur += take;
+        len -= take;
+    }
+    return true;
+}
+
+static bool sw_write_block(yyjson_sw *sw, const void *src, usize len) {
+    usize direct_cap = (usize)(sw->stk - sw->out);
+    if (!sw->fn || len < direct_cap) return sw_write_bytes(sw, src, len);
+    if (!yyjson_sw_flush(sw)) return false;
+    if (!sw->fn(sw->ctx, src, len)) {
+        return_err(IO, "streaming writer output callback failed");
+    }
+    sw->ofs += (u64)len;
+    return true;
+}
+
+static bool sw_write_byte(yyjson_sw *sw, u8 byte) {
+    if (!yyjson_impl_sw_make_room(sw, 1)) return false;
+    *sw->cur++ = byte;
+    return true;
+}
+
+static bool sw_write_indent(yyjson_sw *sw, usize depth) {
+    static const char spaces[] =
+        "                                                                ";
+    usize len = depth * ((sw->flg & YYJSON_WRITE_PRETTY_TWO_SPACES) ? 2 : 4);
+    if (!sw_write_byte(sw, '\n')) return false;
+    while (len >= sizeof(spaces) - 1) {
+        if (!sw_write_bytes(sw, spaces, sizeof(spaces) - 1)) return false;
+        len -= sizeof(spaces) - 1;
+    }
+    return !len || sw_write_bytes(sw, spaces, len);
+}
+
+bool yyjson_impl_sw_pretty(yyjson_sw *sw, usize depth, bool comma) {
+    if (comma && !sw_write_byte(sw, ',')) return false;
+    return sw_write_indent(sw, depth);
+}
+
+bool yyjson_impl_sw_fail(yyjson_sw *sw, yyjson_write_code code,
+                         const char *msg) {
+    sw->fail = true;
+    sw->err.code = code;
+    sw->err.msg = msg;
+    return false;
+}
+
+static_noinline bool sw_write_quoted_chunked(yyjson_sw *sw,
+                                             const char *str, usize len) {
+    const char_enc_type *enc_table = get_enc_table_with_flag(sw->flg);
+    const u8 *hex_table = get_hex_table_with_flag(sw->flg);
+    const u8 *src = (const u8 *)str;
+    const bool esc = (sw->flg & YYJSON_WRITE_ESCAPE_UNICODE) != 0;
+#if YYJSON_DISABLE_NON_STANDARD
+    const bool inv = false;
+#else
+    const bool inv = (sw->flg & YYJSON_WRITE_ALLOW_INVALID_UNICODE) != 0;
+#endif
+    u8 tmp[1024];
+    usize max_in = (sizeof(tmp) - 2) / 6;
+    if (!sw_write_byte(sw, '"')) return false;
+    while (len) {
+        u8 *next;
+        usize take = yyjson_min(len, max_in);
+        usize out_len;
+        if (take < len && (src[take] & 0xC0) == 0x80) {
+            usize cut = take;
+            while (cut && (src[cut] & 0xC0) == 0x80) cut--;
+            if (cut) take = cut;
+        }
+        next = write_str(tmp, esc, inv, src, take, enc_table, hex_table);
+        if (unlikely(!next)) goto utf8_err;
+        out_len = (usize)(next - tmp) - 2;
+        if (!sw_write_bytes(sw, tmp + 1, out_len)) return false;
+        src += take;
+        len -= take;
+    }
+    return sw_write_byte(sw, '"');
+
+utf8_err:
+    return_err(INVALID_STRING, "invalid UTF-8 string");
+}
+
+static bool sw_write_quoted(yyjson_sw *sw, const char *str, usize len) {
+    const char_enc_type *enc_table = get_enc_table_with_flag(sw->flg);
+    const u8 *hex_table = get_hex_table_with_flag(sw->flg);
+    const u8 *src = (const u8 *)str;
+    const bool esc = (sw->flg & YYJSON_WRITE_ESCAPE_UNICODE) != 0;
+#if YYJSON_DISABLE_NON_STANDARD
+    const bool inv = false;
+#else
+    const bool inv = (sw->flg & YYJSON_WRITE_ALLOW_INVALID_UNICODE) != 0;
+#endif
+    usize direct_cap = (usize)(sw->stk - sw->out);
+
+    /* copy large escape-free ASCII strings straight through the window. */
+    if (direct_cap >= 2 && len > (direct_cap - 2) / 6 &&
+        yyjson_impl_sw_is_plain(sw, str, len)) {
+        return sw_write_byte(sw, '"') &&
+               sw_write_block(sw, str, len) &&
+               sw_write_byte(sw, '"');
+    }
+
+    /* use the normal string writer when one encoded string fits. */
+    if (direct_cap >= 2 && len <= (direct_cap - 2) / 6) {
+        u8 *next;
+        usize need = len * 6 + 2; /* + the two quotes */
+        if ((usize)(sw->stk - sw->cur) < need) {
+            /* memory mode may still fit the actual encoded length. */
+            if (!sw->fn) return sw_write_quoted_chunked(sw, str, len);
+            if (!yyjson_impl_sw_make_room(sw, need)) return false;
+        }
+        next = write_str(sw->cur, esc, inv, src, len, enc_table, hex_table);
+        if (unlikely(!next)) return_err(INVALID_STRING, "invalid UTF-8 string");
+        sw->cur = next;
+        return true;
+    }
+    return sw_write_quoted_chunked(sw, str, len);
+}
+
+static bool sw_write_ascii(yyjson_sw *sw, const char *str, usize len) {
+    return sw_write_byte(sw, '"') &&
+           sw_write_block(sw, str, len) &&
+           sw_write_byte(sw, '"');
+}
+
+bool yyjson_impl_sw_key(yyjson_sw *sw, const char *key, usize len,
+                        bool plain) {
+    if ((sw->st & YYJSON_SW_ST_HAS_VALUE) && !sw_write_byte(sw, ',')) {
+        return false;
+    }
+    if ((sw->st & YYJSON_SW_ST_PRETTY) &&
+        !sw_write_indent(sw, sw->depth)) return false;
+    if (!(plain ? sw_write_ascii(sw, key, len) :
+                   sw_write_quoted(sw, key, len)) ||
+        !sw_write_byte(sw, ':')) return false;
+    if ((sw->st & YYJSON_SW_ST_PRETTY) &&
+        !sw_write_byte(sw, ' ')) return false;
+    sw->st |= YYJSON_SW_ST_NEED_VALUE;
+    return true;
+}
+
+bool yyjson_impl_sw_str(yyjson_sw *sw, const char *str, usize len, bool plain) {
+    if (!yyjson_impl_sw_before_value(sw) ||
+        !(plain ? sw_write_ascii(sw, str, len) :
+                  sw_write_quoted(sw, str, len))) return false;
+    return yyjson_impl_sw_after_value(sw);
+}
+
+static_noinline bool sw_write_number_slow(yyjson_sw *sw, yyjson_val val) {
+    u8 buf[FP_BUF_LEN];
+    u8 *end;
+    end = write_num(buf, &val, sw->flg & ~YYJSON_WRITE_ALLOW_INF_AND_NAN);
+    if (!end) return_err(INVALID_VALUE_TYPE, "number write failed");
+    if (!sw_write_bytes(sw, buf, (usize)(end - buf))) return false;
+    return yyjson_impl_sw_after_value(sw);
+}
+
+static bool sw_write_number(yyjson_sw *sw, yyjson_val val) {
+    u8 *end;
+    if (!yyjson_impl_sw_before_value(sw)) return false;
+    if (unlikely((usize)(sw->stk - sw->cur) < FP_BUF_LEN)) {
+        return sw_write_number_slow(sw, val);
+    }
+    end = write_num(sw->cur, &val, sw->flg & ~YYJSON_WRITE_ALLOW_INF_AND_NAN);
+    if (unlikely(!end)) return_err(INVALID_VALUE_TYPE, "number write failed");
+    sw->cur = end;
+    return yyjson_impl_sw_after_value(sw);
+}
+
+static_noinline bool sw_write_integer_slow(yyjson_sw *sw, u64 val, bool neg) {
+    u8 buf[32];
+    u8 *cur = buf;
+    if (neg) *cur++ = '-';
+    cur = write_u64(val, cur);
+    if (!sw_write_bytes(sw, buf, (usize)(cur - buf))) return false;
+    return yyjson_impl_sw_after_value(sw);
+}
+
+bool yyjson_sw_write_uint(yyjson_sw *sw, u64 val) {
+    u8 *cur;
+    if (!sw || sw->fail) return false;
+    if (!yyjson_impl_sw_before_value(sw)) return false;
+    if (unlikely((usize)(sw->stk - sw->cur) < 20)) { /* max uint length */
+        return sw_write_integer_slow(sw, val, false);
+    }
+    cur = write_u64(val, sw->cur);
+    sw->cur = cur;
+    return yyjson_impl_sw_after_value(sw);
+}
+
+bool yyjson_sw_write_sint(yyjson_sw *sw, i64 val) {
+    u64 pos, neg;
+    usize sign;
+    u8 *cur;
+    if (!sw || sw->fail) return false;
+    if (!yyjson_impl_sw_before_value(sw)) return false;
+    pos = (u64)val;
+    neg = ~pos + 1;
+    sign = val < 0;
+    if (unlikely((usize)(sw->stk - sw->cur) < 21)) { /* max sint length */
+        return sw_write_integer_slow(sw, sign ? neg : pos, sign != 0);
+    }
+    cur = sw->cur;
+    *cur = '-';
+    sw->cur = write_u64(sign ? neg : pos, cur + sign);
+    return yyjson_impl_sw_after_value(sw);
+}
+
+static_inline bool sw_reject_inf_or_nan(const yyjson_sw *sw, f64 val) {
+    return (f64_is_inf(val) || f64_is_nan(val)) &&
+           !(sw->flg & YYJSON_WRITE_INF_AND_NAN_AS_NULL);
+}
+
+bool yyjson_sw_write_real(yyjson_sw *sw, f64 val) {
+    yyjson_val num;
+    if (!sw || sw->fail) return false;
+    if (unlikely(sw_reject_inf_or_nan(sw, val))) {
+        return_err(NAN_OR_INF, "NaN or Infinity is not allowed");
+    }
+    unsafe_yyjson_set_real(&num, val);
+    return sw_write_number(sw, num);
+}
+
+bool yyjson_sw_write_num(yyjson_sw *sw, const yyjson_val *num) {
+    yyjson_val tmp;
+    yyjson_subtype subtype;
+    if (!sw || sw->fail) return false;
+    if (!num || unsafe_yyjson_get_type(num) != YYJSON_TYPE_NUM) {
+        return_err(INVALID_VALUE_TYPE, "value is not a number");
+    }
+    tmp = *num;
+    subtype = unsafe_yyjson_get_subtype(&tmp);
+    if (subtype != YYJSON_SUBTYPE_UINT && subtype != YYJSON_SUBTYPE_SINT &&
+        subtype != YYJSON_SUBTYPE_REAL) {
+        return_err(INVALID_VALUE_TYPE, "number subtype is invalid");
+    }
+    if (subtype == YYJSON_SUBTYPE_REAL) {
+        if (unlikely(sw_reject_inf_or_nan(sw, tmp.uni.f64))) {
+            return_err(NAN_OR_INF, "NaN or Infinity is not allowed");
+        }
+    }
+    return sw_write_number(sw, tmp);
+}
+
+bool yyjson_sw_write_scalar(yyjson_sw *sw, const yyjson_val *val) {
+    if (!sw || sw->fail) return false;
+    if (!val) return_err(INVALID_PARAMETER, "value pointer is NULL");
+    switch (unsafe_yyjson_get_type(val)) {
+        case YYJSON_TYPE_NULL:
+            return yyjson_sw_write_null(sw);
+        case YYJSON_TYPE_BOOL:
+            return yyjson_sw_write_bool(sw, unsafe_yyjson_get_bool(val));
+        case YYJSON_TYPE_NUM:
+            return yyjson_sw_write_num(sw, val);
+        case YYJSON_TYPE_STR:
+            return yyjson_sw_write_strn(sw, unsafe_yyjson_get_str(val),
+                                        unsafe_yyjson_get_len(val));
+        case YYJSON_TYPE_RAW:
+            return yyjson_sw_write_rawn(sw, unsafe_yyjson_get_raw(val),
+                                        unsafe_yyjson_get_len(val));
+        default:
+            return_err(INVALID_VALUE_TYPE, "value is not a scalar");
+    }
+}
+
+bool yyjson_sw_write_rawn(yyjson_sw *sw, const char *raw, usize len) {
+    if (!sw || sw->fail) return false;
+    if (!raw) return_err(INVALID_PARAMETER, "raw JSON pointer is NULL");
+    if (!yyjson_impl_sw_before_value(sw) ||
+        !sw_write_block(sw, raw, len)) {
+        return false;
+    }
+    return yyjson_impl_sw_after_value(sw);
+}
+
+bool yyjson_sw_flush(yyjson_sw *sw) {
+    usize len;
+    if (!sw || sw->fail) return false;
+    if (!sw->fn) return true;
+    len = (usize)(sw->cur - sw->out);
+    if (!len) return true;
+    if (!sw->fn(sw->ctx, sw->out, len)) {
+        return_err(IO, "streaming writer output callback failed");
+    }
+    sw->ofs += (u64)len;
+    sw->cur = sw->out;
+    return true;
+}
+
+bool yyjson_sw_finish(yyjson_sw *sw) {
+    if (!sw || sw->fail) return false;
+    if (sw->done) return true;
+    if (sw->depth != 0 || !sw->root) {
+        return_err(INVALID_PARAMETER, "invalid streaming writer state");
+    }
+    if ((sw->flg & YYJSON_WRITE_NEWLINE_AT_END) &&
+        !sw_write_byte(sw, '\n')) return false;
+    if (!yyjson_sw_flush(sw)) return false;
+    sw->done = true;
+    return true;
+}
+
+bool yyjson_sw_doc_next(yyjson_sw *sw) {
+    if (!sw || sw->fail) return false;
+    if (sw->done || sw->depth != 0 || !sw->root) {
+        return_err(INVALID_PARAMETER, "invalid streaming writer state");
+    }
+    if (!sw_write_byte(sw, '\n')) return false;
+    sw->root = false;
+    return true;
+}
+#endif /* !YYJSON_DISABLE_WRITER */
+
+#undef return_err
+#endif /* !YYJSON_DISABLE_STREAMING */

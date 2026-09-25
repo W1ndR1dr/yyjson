@@ -1,0 +1,54 @@
+# Weekly: copy release tags that upstream has and this fork lacks, so Forge's
+# SwiftPM mirrors can resolve new versions (W1ndR1dr/Forge dt-0924-731;
+# docs/ops/DEPENDENCY_FORKS.md). Deployed by Forge's scripts/ci/fork-sync.sh.
+#
+# It only ever adds tags. It never moves or deletes a tag and never touches a
+# branch, so nothing a Forge lockfile pins can change under it. To stop it,
+# disable this workflow in the Actions tab (or run fork-sync.sh disable).
+name: fork-sync
+on:
+  schedule:
+    - cron: "41 7 * * 1"
+  workflow_dispatch:
+permissions:
+  contents: write
+  actions: write
+concurrency:
+  group: fork-sync
+jobs:
+  tags:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      UPSTREAM: ibireme/yyjson
+    steps:
+      - name: Copy new upstream tags
+        run: |
+          set -euo pipefail
+          # A deleted upstream hands the fork network to a stranger's fork:
+          # refuse to sync from anything but the upstream this fork was made from.
+          parent=$(gh api "repos/$GITHUB_REPOSITORY" --jq '.parent.full_name // ""')
+          if [ "$parent" != "$UPSTREAM" ]; then
+            echo "::error::parent is '$parent', expected '$UPSTREAM'; see docs/ops/DEPENDENCY_FORKS.md in W1ndR1dr/Forge"
+            exit 1
+          fi
+          git ls-remote --tags --refs "https://github.com/$UPSTREAM.git" | sort > upstream
+          git ls-remote --tags --refs "https://github.com/$GITHUB_REPOSITORY.git" | sort > fork
+          comm -23 upstream fork | cut -f2 > differ
+          cut -f2 fork | grep -Fx -f - differ > moved || true
+          grep -Fvx -f moved differ > new || true
+          if [ -s new ]; then
+            git init -q --bare repo
+            sed 's/.*/+&:&/' new | xargs git -C repo fetch -q --no-tags "https://github.com/$UPSTREAM.git"
+            gh auth setup-git
+            # No --force: an existing tag is never moved.
+            xargs git -C repo push --porcelain "https://github.com/$GITHUB_REPOSITORY.git" < new
+          fi
+          echo "copied $(wc -l < new) new tag(s) from $UPSTREAM"
+          # Scheduled workflows stop after 60 days without repository activity; re-enabling resets that clock.
+          gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/fork-sync.yml/enable"
+          if [ -s moved ]; then
+            echo "::error::upstream moved tag(s) this fork already has; left unchanged: $(tr '\n' ' ' < moved)"
+            exit 1
+          fi
